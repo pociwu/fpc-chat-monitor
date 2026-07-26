@@ -1,0 +1,25 @@
+# Private configuration and runtime state
+config.json
+fpc_state.json
+
+# Captured chat content, diagnostics, attachments, and browser state
+scraped_chats/
+network_diagnostics/
+History/
+ms-playwright/
+.codex-remote-attachments/
+.scratch/
+*.log
+*.jsonl
+messages_*.csv
+sent_log_*.csv
+sent_flags_*.json
+message_api_*.jsonl
+
+# Python and editor artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.vscode/
