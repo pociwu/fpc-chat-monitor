@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 
-SOURCE = Path(__file__).resolve().parents[1] / "fpc_watch_ui_login_telegram_v2026.07.27.3.py"
+SOURCE = Path(__file__).resolve().parents[1] / "fpc_watch_ui_login_telegram_v2026.07.27.4.py"
 SPEC = importlib.util.spec_from_file_location("watcher", SOURCE)
 watcher = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(watcher)
@@ -89,6 +89,14 @@ class SocketIoFrameTests(unittest.TestCase):
         self.assertTrue(fallback["is_preview"])
         self.assertEqual(fallback["sender"], "側欄預覽（可能截斷）")
         self.assertEqual(fallback["text"], "這是截斷預覽...")
+
+    def test_telegram_hides_preview_provenance_label(self):
+        rendered = watcher.format_for_tg(
+            "晶圓三班佈告欄", "1", "這是截斷預覽...", "下午 2:25", None, "側欄預覽（可能截斷）"
+        )
+
+        self.assertNotIn("側欄預覽", rendered)
+        self.assertIn("這是截斷預覽...", rendered)
 
 
 if __name__ == "__main__":
