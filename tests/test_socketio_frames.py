@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 
-SOURCE = Path(__file__).resolve().parents[1] / "fpc_watch_ui_login_telegram_v2026.07.27.4.py"
+SOURCE = Path(__file__).resolve().parents[1] / "fpc_watch_ui_login_telegram_v2026.07.27.5.py"
 SPEC = importlib.util.spec_from_file_location("watcher", SOURCE)
 watcher = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(watcher)
@@ -81,22 +81,21 @@ class SocketIoFrameTests(unittest.TestCase):
 
         self.assertEqual([item["text"] for item in candidates], ["最後一則完整訊息"])
 
-    def test_preview_fallback_is_explicitly_labelled(self):
+    def test_preview_fallback_has_no_artificial_sender_label(self):
         fallback = watcher._preview_fallback_message({
             "group": "晶圓三班佈告欄 (13)", "preview": "這是截斷預覽...", "time": "下午 2:25",
         })
 
         self.assertTrue(fallback["is_preview"])
-        self.assertEqual(fallback["sender"], "側欄預覽（可能截斷）")
+        self.assertEqual(fallback["sender"], "")
         self.assertEqual(fallback["text"], "這是截斷預覽...")
 
-    def test_telegram_hides_preview_provenance_label(self):
+    def test_telegram_renders_preview_without_sender_prefix(self):
         rendered = watcher.format_for_tg(
-            "晶圓三班佈告欄", "1", "這是截斷預覽...", "下午 2:25", None, "側欄預覽（可能截斷）"
+            "晶圓三班佈告欄", "1", "這是截斷預覽...", "下午 2:25", None, ""
         )
 
-        self.assertNotIn("側欄預覽", rendered)
-        self.assertIn("這是截斷預覽...", rendered)
+        self.assertEqual(rendered.splitlines()[1], "這是截斷預覽...")
 
 
 if __name__ == "__main__":

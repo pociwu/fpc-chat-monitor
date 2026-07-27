@@ -131,7 +131,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 BASE = Path(__file__).resolve().parent
 CONFIG_PATH = BASE / "config.json"
-APP_VERSION = "v2026.07.27.4"
+APP_VERSION = "v2026.07.27.5"
 
 def one_line(s: str, keep_newline: bool = False) -> str:
     if not s:
@@ -281,12 +281,12 @@ def _candidate_for_group(candidates: List[Dict], group: str) -> Optional[Dict]:
     return matched[-1]
 
 def _preview_fallback_message(pending: Dict) -> Dict:
-    """Create an explicitly labelled message when no full payload arrives."""
+    """Create a side-preview fallback when no full payload arrives."""
     return {
         "type": "network_msg",
         "group": one_line(pending.get("group", "")),
         "text": one_line(pending.get("preview", "")),
-        "sender": "側欄預覽（可能截斷）",
+        "sender": "",
         "time": one_line(pending.get("time", "")),
         "attachments": [],
         "source": "side_preview_fallback",
@@ -503,9 +503,7 @@ def escape_mdv2(s: str) -> str:
 
 def format_for_tg(name: str, badge: str, content: str, ts_display: str, parse_mode: Optional[str], sender: str = "") -> str:
     """聊天室訊息版：title=群組名(+未讀)；第二行=內容；第三行=時間；若有 sender 放進內容前綴。"""
-    # Preview provenance remains in CSV diagnostics, but Telegram should show the
-    # preview text without an artificial sender label.
-    sender_prefix = f"[{sender}] " if sender and sender != "側欄預覽（可能截斷）" else ""
+    sender_prefix = f"[{sender}] " if sender else ""
     if parse_mode == "HTML":
         import html
         n = html.escape(name or "")
