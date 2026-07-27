@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 
-SOURCE = Path(__file__).resolve().parents[1] / "fpc_watch_ui_login_telegram_v2026.07.27.2.py"
+SOURCE = Path(__file__).resolve().parents[1] / "fpc_watch_ui_login_telegram_v2026.07.27.3.py"
 SPEC = importlib.util.spec_from_file_location("watcher", SOURCE)
 watcher = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(watcher)
@@ -80,6 +80,15 @@ class SocketIoFrameTests(unittest.TestCase):
         )
 
         self.assertEqual([item["text"] for item in candidates], ["最後一則完整訊息"])
+
+    def test_preview_fallback_is_explicitly_labelled(self):
+        fallback = watcher._preview_fallback_message({
+            "group": "晶圓三班佈告欄 (13)", "preview": "這是截斷預覽...", "time": "下午 2:25",
+        })
+
+        self.assertTrue(fallback["is_preview"])
+        self.assertEqual(fallback["sender"], "側欄預覽（可能截斷）")
+        self.assertEqual(fallback["text"], "這是截斷預覽...")
 
 
 if __name__ == "__main__":

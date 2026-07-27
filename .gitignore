@@ -15,6 +15,7 @@ messages_*.csv
 sent_log_*.csv
 sent_flags_*.json
 message_api_*.jsonl
+local_verification/
 
 # Python and editor artifacts
 __pycache__/

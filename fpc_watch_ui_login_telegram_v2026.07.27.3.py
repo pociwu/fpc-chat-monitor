@@ -131,7 +131,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 BASE = Path(__file__).resolve().parent
 CONFIG_PATH = BASE / "config.json"
-APP_VERSION = "v2026.07.27.2"
+APP_VERSION = "v2026.07.27.3"
 
 def one_line(s: str, keep_newline: bool = False) -> str:
     if not s:
@@ -279,6 +279,19 @@ def _candidate_for_group(candidates: List[Dict], group: str) -> Optional[Dict]:
     if not matched:
         return None
     return matched[-1]
+
+def _preview_fallback_message(pending: Dict) -> Dict:
+    """Create an explicitly labelled message when no full payload arrives."""
+    return {
+        "type": "network_msg",
+        "group": one_line(pending.get("group", "")),
+        "text": one_line(pending.get("preview", "")),
+        "sender": "側欄預覽（可能截斷）",
+        "time": one_line(pending.get("time", "")),
+        "attachments": [],
+        "source": "side_preview_fallback",
+        "is_preview": True,
+    }
 
 def _replace_group_in_request(value: str, learned_group: str, target_group: str) -> str:
     """Replay a learned request for another group without ever manipulating the UI."""
@@ -2349,13 +2362,20 @@ class App(tk.Tk):
                     try:
                         msg = await asyncio.wait_for(py_msg_q.get(), timeout=0.05)
                     except asyncio.TimeoutError:
-                        # 未收到完整網路資料時，依既有承諾只留預覽與診斷，不自動點入群組。
+                        # 未收到完整網路資料時，不自動點入群組；改以明確標示的側欄預覽備援。
                         now = time.time()
                         for key, pending in list(pending_groups.items()):
                             if now - pending["queued_at"] >= 8:
                                 pending_groups.pop(key, None)
-                                self._push_from_worker({"type": "log", "text":
-                                    f"[NET] full message unavailable for {pending['group']}; truncated preview withheld\n"})
+                                fallback = _preview_fallback_message(pending)
+                                if fallback["text"]:
+                                    await py_msg_q.put(fallback)
+                                    self._push_from_worker({"type": "log", "text":
+                                        f"[NET] full message unavailable for {pending['group']}; "
+                                        "forwarding labelled sidebar preview\n"})
+                                else:
+                                    self._push_from_worker({"type": "log", "text":
+                                        f"[NET] full message unavailable for {pending['group']}; no preview to forward\n"})
                         continue
 
                     sys_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")

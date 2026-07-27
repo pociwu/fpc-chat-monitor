@@ -1,0 +1,25 @@
+{
+  "urls": {
+    "base": "https://im.fpcetg.com.tw/",
+    "login": "https://im.fpcetg.com.tw/login"
+  },
+  "login": {
+    "username": "",
+    "password": "",
+    "force_relogin": false
+  },
+  "browser": {
+    "headless": false,
+    "storage_state_file": "fpc_state.json"
+  },
+  "watch": {
+    "out_dir": "local_verification",
+    "debug": true
+  },
+  "telegram": {
+    "enabled": false,
+    "bot_token": "",
+    "chat_id": "",
+    "parse_mode": "HTML"
+  }
+}
