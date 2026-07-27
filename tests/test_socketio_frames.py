@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 
-SOURCE = Path(__file__).resolve().parents[1] / "fpc_watch_ui_login_telegram_v2026.07.27.1.py"
+SOURCE = Path(__file__).resolve().parents[1] / "fpc_watch_ui_login_telegram_v2026.07.27.2.py"
 SPEC = importlib.util.spec_from_file_location("watcher", SOURCE)
 watcher = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(watcher)
@@ -56,6 +56,17 @@ class SocketIoFrameTests(unittest.TestCase):
             {"data": {"channels": [{"cid": "channel-42", "name": "晶圓三班佈告欄"}]}}, names
         )
         self.assertEqual(names, {"channel-42": "晶圓三班佈告欄"})
+
+    def test_message_sender_name_does_not_overwrite_channel_name_mapping(self):
+        names = {"channel-42": "晶圓三班佈告欄"}
+        response = {"data": {
+            "cid": "channel-42",
+            "messages": [{"cid": "channel-42", "name": "王小明", "message": "完整內容"}],
+        }}
+
+        watcher._remember_channel_names(response, names)
+
+        self.assertEqual(names["channel-42"], "晶圓三班佈告欄")
 
     def test_get_message_response_ignores_lastmsg_and_uses_message_body(self):
         response = {"data": {

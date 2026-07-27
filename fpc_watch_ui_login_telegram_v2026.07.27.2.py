@@ -131,7 +131,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 BASE = Path(__file__).resolve().parent
 CONFIG_PATH = BASE / "config.json"
-APP_VERSION = "v2026.07.27.1"
+APP_VERSION = "v2026.07.27.2"
 
 def one_line(s: str, keep_newline: bool = False) -> str:
     if not s:
@@ -248,22 +248,25 @@ def _json_shape(value, depth: int = 2):
     return type(value).__name__
 
 def _remember_channel_names(payload, channel_names: Dict[str, str]) -> None:
-    """Learn CID-to-title mappings from the channel-list socket response."""
+    """Learn CID-to-title mappings from explicit channel-list entries only."""
     cid_keys = ("cid", "channelId", "channelID", "roomId", "roomID", "conversationId")
     name_keys = ("groupName", "channelName", "roomName", "conversationName", "title", "name")
-    def walk(value):
+    channel_list_keys = {"channels", "channelList", "channel_list"}
+
+    def walk(value, is_channel_entry: bool = False):
         if isinstance(value, list):
             for item in value:
-                walk(item)
+                walk(item, is_channel_entry)
         elif isinstance(value, dict):
-            cid = next((str(value[key]) for key in cid_keys if value.get(key) not in (None, "")), "")
-            name = next((value[key] for key in name_keys
-                         if isinstance(value.get(key), str) and value[key].strip()), "")
-            if cid and name:
-                channel_names[cid] = one_line(name)
-            for item in value.values():
+            if is_channel_entry:
+                cid = next((str(value[key]) for key in cid_keys if value.get(key) not in (None, "")), "")
+                name = next((value[key] for key in name_keys
+                             if isinstance(value.get(key), str) and value[key].strip()), "")
+                if cid and name:
+                    channel_names[cid] = one_line(name)
+            for key, item in value.items():
                 if isinstance(item, (dict, list)):
-                    walk(item)
+                    walk(item, key in channel_list_keys)
     walk(payload)
 
 def _candidate_for_group(candidates: List[Dict], group: str) -> Optional[Dict]:
