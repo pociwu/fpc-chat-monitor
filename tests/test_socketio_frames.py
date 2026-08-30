@@ -1,15 +1,66 @@
 import importlib.util
+import os
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
-SOURCE = Path(__file__).resolve().parents[1] / "fpc_watch_ui_login_telegram_v2026.07.27.5.py"
+SOURCE = Path(__file__).resolve().parents[1] / "fpc_watch_ui_login_telegram_v2026.08.30.1.py"
 SPEC = importlib.util.spec_from_file_location("watcher", SOURCE)
 watcher = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(watcher)
 
 
 class SocketIoFrameTests(unittest.TestCase):
+    def test_local_verification_can_force_disable_telegram(self):
+        cfg = {"telegram": {"enabled": True, "bot_token": "secret", "chat_id": "123"}}
+
+        with patch.dict(os.environ, {"FPC_DISABLE_TELEGRAM": "1"}):
+            forwarder = watcher.TelegramForwarder(cfg)
+
+        self.assertFalse(forwarder.enabled)
+
+    def test_dense_identical_photo_events_remain_distinct(self):
+        response = {
+            "data": {
+                "cid": "channel-42",
+                "messages": [
+                    {"messageId": "photo-1", "message": "黃紹瑄傳送了照片。"},
+                    {"messageId": "photo-2", "message": "黃紹瑄傳送了照片。"},
+                ],
+            }
+        }
+
+        candidates = watcher._network_message_candidates(
+            response, "ws:test", {"channel-42": "台塑群組網"}
+        )
+
+        self.assertEqual([item["message_id"] for item in candidates], ["photo-1", "photo-2"])
+        keys = [watcher._message_delivery_key(item) for item in candidates]
+        self.assertEqual(len(set(keys)), 2)
+
+    def test_attachment_url_can_be_a_direct_string(self):
+        self.assertEqual(
+            watcher._attachment_urls(["https://example.test/files/photo-1.png"]),
+            [("https://example.test/files/photo-1.png", "")],
+        )
+
+    def test_pending_preview_buffer_does_not_overwrite_same_group(self):
+        pending = watcher.PendingPreviewBuffer()
+        pending.add({"group": "台塑群組網 (13)", "group_key": "台塑群組網",
+                     "text": "黃紹瑄傳送了照片。", "badge": "1"}, now=0)
+        pending.add({"group": "台塑群組網 (14)", "group_key": "台塑群組網",
+                     "text": "黃紹瑄傳送了照片。", "badge": "2"}, now=0.1)
+
+        first = pending.pop_for_group("台塑群組網")
+
+        self.assertEqual(first["badge"], "1")
+
+        expired = pending.pop_expired(now=9, max_age=8)
+
+        self.assertEqual(len(expired), 1)
+        self.assertEqual([item["badge"] for item in expired], ["2"])
+
     def test_event_payload_reaches_message_candidate_parser(self):
         frame = '42["message:new",{"groupName":"晶圓三班佈告欄","content":"飲料我都拿到樓上右邊的冰箱了","senderName":"王小明","createdAt":"2026-07-25T14:25:00"}]'
 

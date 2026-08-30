@@ -131,7 +131,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 BASE = Path(__file__).resolve().parent
 CONFIG_PATH = BASE / "config.json"
-APP_VERSION = "v2026.07.27.5"
+APP_VERSION = "v2026.08.30.1"
 
 def one_line(s: str, keep_newline: bool = False) -> str:
     if not s:
@@ -152,6 +152,7 @@ def _network_message_candidates(payload, source: str = "", channel_names: Option
     sender_keys = ("sender", "senderName", "fromName", "author", "nickname", "userName")
     time_keys = ("time", "createdAt", "sendTime", "timestamp", "created_at")
     attach_keys = ("attachments", "attachment", "files", "file", "media", "medias")
+    message_id_keys = ("messageId", "messageID", "msgId", "msgID", "message_id", "uuid")
     def walk(v, inherited_cid: str = ""):
         if isinstance(v, list):
             for x in v: walk(x, inherited_cid)
@@ -164,13 +165,15 @@ def _network_message_candidates(payload, source: str = "", channel_names: Option
             sender = next((v[k] for k in sender_keys if isinstance(v.get(k), str) and v[k].strip()), "")
             sent = next((str(v[k]) for k in time_keys if v.get(k) not in (None, "")), "")
             attachments = next((v[k] for k in attach_keys if v.get(k) is not None), [])
+            message_id = next((str(v[k]) for k in message_id_keys if v.get(k) not in (None, "")), "")
             if group and (text or attachments):
-                key = (group, str(text), sent, json.dumps(attachments, ensure_ascii=False, sort_keys=True, default=str))
+                key = (group, message_id, str(text), sent,
+                       json.dumps(attachments, ensure_ascii=False, sort_keys=True, default=str))
                 if key not in seen:
                     seen.add(key)
                     out.append({"type": "network_msg", "group": group, "cid": cid, "text": text, "sender": sender,
                                 "time": sent, "attachments": attachments if isinstance(attachments, list) else [attachments],
-                                "source": source})
+                                "message_id": message_id, "source": source})
             for x in v.values():
                 if isinstance(x, (dict, list)): walk(x, cid)
                 elif isinstance(x, str) and x.lstrip().startswith(("{", "[")):
@@ -291,7 +294,68 @@ def _preview_fallback_message(pending: Dict) -> Dict:
         "attachments": [],
         "source": "side_preview_fallback",
         "is_preview": True,
+        "event_token": one_line(pending.get("event_token", "")),
+        "badge": one_line(pending.get("badge", "")),
     }
+
+class PendingPreviewBuffer:
+    """保留密集側欄事件；同群組的新事件不可覆蓋舊事件。"""
+    def __init__(self):
+        self._items: List[Dict] = []
+
+    @staticmethod
+    def _key(group: str) -> str:
+        return re.sub(r"\s+", " ", group or "").strip().casefold()
+
+    def __bool__(self) -> bool:
+        return bool(self._items)
+
+    def add(self, event: Dict, now: Optional[float] = None) -> Dict:
+        item = dict(event)
+        item["queued_at"] = time.time() if now is None else now
+        self._items.append(item)
+        return item
+
+    def has_group(self, group_key: str) -> bool:
+        wanted = self._key(group_key)
+        return any(self._key(item.get("group_key") or item.get("group", "")) == wanted
+                   for item in self._items)
+
+    def pop_for_group(self, group_key: str) -> Optional[Dict]:
+        wanted = self._key(group_key)
+        for index, item in enumerate(self._items):
+            if self._key(item.get("group_key") or item.get("group", "")) == wanted:
+                return self._items.pop(index)
+        return None
+
+    def remove(self, target: Dict) -> bool:
+        for index, item in enumerate(self._items):
+            if item is target:
+                self._items.pop(index)
+                return True
+        return False
+
+    def pop_expired(self, now: Optional[float] = None, max_age: float = 8) -> List[Dict]:
+        current = time.time() if now is None else now
+        expired = [item for item in self._items if current - item["queued_at"] >= max_age]
+        self._items = [item for item in self._items if current - item["queued_at"] < max_age]
+        return expired
+
+
+def _message_delivery_key(item: Dict) -> str:
+    """建立逐筆傳送鍵；相同文字的不同訊息仍必須各自送達。"""
+    attachments = _attachment_urls(item.get("attachments", []))
+    identity = {
+        "group": one_line(item.get("group", "")),
+        "message_id": one_line(item.get("message_id", "")),
+        "event_token": one_line(item.get("event_token", "")),
+        "badge": one_line(item.get("badge", "")),
+        "time": one_line(item.get("time", "")),
+        "text": one_line(item.get("text", ""), keep_newline=True),
+        "attachments": attachments,
+    }
+    raw = json.dumps(identity, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 def _replace_group_in_request(value: str, learned_group: str, target_group: str) -> str:
     """Replay a learned request for another group without ever manipulating the UI."""
@@ -314,10 +378,16 @@ def _attachment_urls(items) -> List[Tuple[str, str]]:
     """回傳 (下載 URL, 原始檔名)；只接受 http(s) URL。"""
     found, seen = [], set()
     def walk(v):
-        if isinstance(v, list):
+        if isinstance(v, str):
+            url = v.strip()
+            if url and url not in seen and (url.startswith(("http://", "https://", "/"))):
+                seen.add(url)
+                found.append((url, ""))
+        elif isinstance(v, list):
             for x in v: walk(x)
         elif isinstance(v, dict):
-            url = next((v[k] for k in ("url", "downloadUrl", "download_url", "fileUrl", "src", "href")
+            url = next((v[k] for k in ("url", "downloadUrl", "download_url", "fileUrl", "file_url",
+                                       "imageUrl", "image_url", "originalUrl", "original_url", "src", "href")
                         if isinstance(v.get(k), str) and v[k].strip()), "")
             if url and url not in seen:
                 seen.add(url)
@@ -526,7 +596,8 @@ def format_for_tg(name: str, badge: str, content: str, ts_display: str, parse_mo
 class TelegramForwarder:
     def __init__(self, cfg: Dict):
         tgc = cfg.get("telegram", {}) or {}
-        self.enabled = bool(tgc.get("enabled", False))
+        force_disabled = os.environ.get("FPC_DISABLE_TELEGRAM", "").strip().casefold() in {"1", "true", "yes"}
+        self.enabled = bool(tgc.get("enabled", False)) and not force_disabled
         self.token = (tgc.get("bot_token") or os.environ.get("TELEGRAM_BOT_TOKEN", "")).strip()
         self.chat_id = (tgc.get("chat_id") or os.environ.get("TELEGRAM_CHAT_ID", "")).strip()
         self.parse_mode = (tgc.get("parse_mode") or os.environ.get("TELEGRAM_PARSE_MODE", "")).strip() or None
@@ -573,6 +644,13 @@ class TelegramForwarder:
                 self._last_ts = time.time()
                 return True
             logging.warning("TG sendMessage 失敗: %s", r.text)
+            if r.status_code == 429:
+                try:
+                    retry_after = max(1, int(r.json().get("parameters", {}).get("retry_after", 1)))
+                except Exception:
+                    retry_after = 1
+                logging.warning("TG rate limited; retry after %ss", retry_after)
+                time.sleep(retry_after)
             if r.status_code == 400 and "parse entities" in r.text.lower():
                 return False
             return False
@@ -603,19 +681,33 @@ class TelegramForwarder:
             return False
         from requests import post  # type: ignore
         method = "sendPhoto" if file_path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"} else "sendDocument"
-        try:
-            self._rl()
-            with open(file_path, "rb") as fh:
-                data = {"chat_id": self.chat_id}
-                if caption:
-                    data["caption"] = caption[:1024]
-                response = post(self._api(method), data=data, files={"photo" if method == "sendPhoto" else "document": fh}, timeout=self.timeout)
-            if response.ok:
-                self._last_ts = time.time()
-                return True
-            logging.warning("TG %s failed: %s", method, response.text)
-        except Exception as e:
-            logging.exception("TG attachment upload failed: %s", e)
+        for attempt in range(1, self.retry + 1):
+            try:
+                self._rl()
+                with open(file_path, "rb") as fh:
+                    data = {"chat_id": self.chat_id}
+                    if caption:
+                        data["caption"] = caption[:1024]
+                    response = post(
+                        self._api(method), data=data,
+                        files={"photo" if method == "sendPhoto" else "document": fh},
+                        timeout=self.timeout,
+                    )
+                if response.ok:
+                    self._last_ts = time.time()
+                    return True
+                logging.warning("TG %s failed(%s/%s): %s", method, attempt, self.retry, response.text)
+                if response.status_code == 429:
+                    try:
+                        retry_after = max(1, int(response.json().get("parameters", {}).get("retry_after", 1)))
+                    except Exception:
+                        retry_after = 1
+                    time.sleep(retry_after)
+                else:
+                    time.sleep(0.6 * attempt)
+            except Exception as e:
+                logging.exception("TG attachment upload failed(%s/%s): %s", attempt, self.retry, e)
+                time.sleep(0.6 * attempt)
         return False
 
 # ---------- Playwright 登入 ----------
@@ -1788,7 +1880,7 @@ class App(tk.Tk):
 
             # 不點入群組：被動攔截頁面本來就收到的 API/WebSocket 訊息。
             # 只有群組側欄剛變動時才接受候選訊息，避免舊資料或其他 API 造成重複轉發。
-            pending_groups: Dict[str, Dict] = {}
+            pending_groups = PendingPreviewBuffer()
             # A getMessageResponse can arrive before the separate channel-list event
             # that maps its CID to the sidebar title. Keep only these unresolved
             # candidates briefly, then retry once the mapping is known.
@@ -1851,8 +1943,11 @@ class App(tk.Tk):
 
                     async def enqueue_if_pending(item: Dict, allow_defer: bool = True) -> bool:
                         key = self._normalize_group(one_line(item.get("group", "")))[0]
-                        if key in pending_groups:
-                            item["preview"] = pending_groups.pop(key).get("preview", "")
+                        pending = pending_groups.pop_for_group(key)
+                        if pending:
+                            item["preview"] = pending.get("preview", "")
+                            item.setdefault("event_token", pending.get("event_token", ""))
+                            item.setdefault("badge", pending.get("badge", ""))
                             await py_msg_q.put(item)
                             return True
                         cid = str(item.get("cid", "") or "")
@@ -1938,7 +2033,7 @@ class App(tk.Tk):
                             item = _candidate_for_group(_network_message_candidates(payload, "backfill", channel_names), group)
                             if item:
                                 item["preview"] = pending.get("preview", "")
-                                pending_groups.pop(key, None)
+                                pending_groups.remove(pending)
                                 await py_msg_q.put(item)
                                 self._push_from_worker({"type": "log", "text":
                                     f"[NET] full last message fetched for {group} without opening the group\n"})
@@ -1993,8 +2088,10 @@ class App(tk.Tk):
                     await delay(200);
                   }
                   const seen = new Set();
-                  const push = (name, prev, time) => {
-                    const payload = { type: 'side_preview', group: name, sender: '', text: prev, time: time || '' };
+                  const push = (name, prev, time, badge) => {
+                    const eventToken = [name, prev, time || '', badge || ''].join('||');
+                    const payload = { type: 'side_preview', group: name, sender: '', text: prev,
+                                      time: time || '', badge: badge || '', event_token: eventToken };
                     try { window.pyPushMsg(payload); } catch (e) {}
                     console.log('[MSG][side]', JSON.stringify(payload));
                   };
@@ -2005,10 +2102,10 @@ class App(tk.Tk):
                       if (!name || !prev) continue;
                       const unread = parseInt((badge||'0').replace(/[^0-9]/g,''), 10) || 0;
                       if (unread <= 0) continue;
-                      const k = name + '||' + key(prev);
+                      const k = name + '||' + key(prev) + '||' + time + '||' + badge;
                       if (seen.has(k)) continue;
                       seen.add(k);
-                      push(name, prev, time);
+                      push(name, prev, time, badge);
                     }
                   };
                   setTimeout(scan, 200);
@@ -2273,48 +2370,9 @@ class App(tk.Tk):
                                 setup();
                               }
                             """)
-                            # ---- ③b 列表預覽觀測器（.subinfo 擷取）----
-                            await pg.evaluate("""
-                              () => {
-                                const delay = (ms) => new Promise(r => setTimeout(r, ms));
-                                const key = (t) => (t||"").trim().slice(0,160) + "::" + (t||"").length;
-                            
-                                const pickRows = () => Array.from(document.querySelectorAll('.el-row'))
-                                  .filter(r => r.querySelector('.ellipsis1') && r.querySelector('.subinfo'));
-                            
-                                const getName = (row) => (row.querySelector('.ellipsis1')?.textContent || '').trim();
-                                const getPrev = (row) => (row.querySelector('.subinfo')?.textContent || '').trim();
-                            
-                                const setup = async () => {
-                                  for (let i=0;i<40;i++) {  // 最多等 8 秒
-                                    if (pickRows().length) break;
-                                    await delay(200);
-                                  }
-                                  const seen = new Set();
-                                  const push = (name, prev) => {
-                                    const payload = { type: 'msg', group: name, sender: '', text: prev, time: '' };
-                                    try { window.pyPushMsg(payload); } catch (e) {}
-                                    console.log('[MSG][subinfo]', JSON.stringify(payload));
-                                  };
-                                  const scan = () => {
-                                    const rows = pickRows();
-                                    for (const r of rows) {
-                                      const name = getName(r), prev = getPrev(r);
-                                      if (!name || !prev) continue;
-                                      const k = name + '||' + key(prev);
-                                      if (seen.has(k)) continue;
-                                      seen.add(k);
-                                      push(name, prev);
-                                    }
-                                  };
-                                  setTimeout(scan, 200);
-                                  const mo = new MutationObserver(() => scan());
-                                  mo.observe(document.body, { childList: true, subtree: true, characterData: true });
-                                  setInterval(scan, 3000);
-                                };
-                                setup();
-                              }
-                            """)
+                            # 側欄預覽只由前面的 side_preview 觀測器送入。
+                            # 舊版此處另有一個直接當成完整訊息的觀測器，會與 8 秒補抓流程競爭，
+                            # 並以「群組＋相同預覽文字」吃掉連續照片事件。
 
 
 
@@ -2363,19 +2421,16 @@ class App(tk.Tk):
                         msg = await asyncio.wait_for(py_msg_q.get(), timeout=0.05)
                     except asyncio.TimeoutError:
                         # 未收到完整網路資料時，不自動點入群組；改以明確標示的側欄預覽備援。
-                        now = time.time()
-                        for key, pending in list(pending_groups.items()):
-                            if now - pending["queued_at"] >= 8:
-                                pending_groups.pop(key, None)
-                                fallback = _preview_fallback_message(pending)
-                                if fallback["text"]:
-                                    await py_msg_q.put(fallback)
-                                    self._push_from_worker({"type": "log", "text":
-                                        f"[NET] full message unavailable for {pending['group']}; "
-                                        "forwarding labelled sidebar preview\n"})
-                                else:
-                                    self._push_from_worker({"type": "log", "text":
-                                        f"[NET] full message unavailable for {pending['group']}; no preview to forward\n"})
+                        for pending in pending_groups.pop_expired(max_age=8):
+                            fallback = _preview_fallback_message(pending)
+                            if fallback["text"]:
+                                await py_msg_q.put(fallback)
+                                self._push_from_worker({"type": "log", "text":
+                                    f"[NET] full message unavailable for {pending['group']}; "
+                                    "forwarding sidebar preview\n"})
+                            else:
+                                self._push_from_worker({"type": "log", "text":
+                                    f"[NET] full message unavailable for {pending['group']}; no preview to forward\n"})
                         continue
 
                     sys_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2383,17 +2438,25 @@ class App(tk.Tk):
                         raw_group = one_line(msg.get("group", ""))
                         key = self._normalize_group(raw_group)[0]
                         if raw_group and key:
-                            pending_groups[key] = {"group": raw_group, "preview": one_line(msg.get("text", "")),
-                                                   "time": one_line(msg.get("time", "")), "queued_at": time.time()}
+                            pending = pending_groups.add({
+                                "group": raw_group,
+                                "group_key": key,
+                                "preview": one_line(msg.get("text", "")),
+                                "time": one_line(msg.get("time", "")),
+                                "badge": one_line(msg.get("badge", "")),
+                                "event_token": one_line(msg.get("event_token", "")),
+                            })
                             self._push_from_worker({"type": "log", "text": f"[NET] waiting full payload: {raw_group}\n"})
-                            asyncio.create_task(backfill_last_message(pending_groups[key]))
+                            asyncio.create_task(backfill_last_message(pending))
                         continue
                     group = one_line(msg.get("group", ""))
                     sender= one_line(msg.get("sender", ""))
                     text  = one_line(msg.get("text", ""))
                     sent  = one_line(msg.get("time", "")) or sys_ts
-                    if not text and not sender:
+                    attachment_refs = _attachment_urls(msg.get("attachments", []))
+                    if not text and not sender and not attachment_refs:
                         continue
+                    delivery_key = _message_delivery_key(msg)
 
                     # 更新 UI（右側）
                     self._push_from_worker({
@@ -2407,7 +2470,9 @@ class App(tk.Tk):
 
                     # CSV 去重（(時間, 群組, 內容)）
                     csv_path = today_csv()
-                    is_dup = self._csv_has_rec(csv_path, sent, group, text) if self._dedup_on("CSV") else False
+                    has_unique_identity = bool(msg.get("message_id") or msg.get("event_token") or attachment_refs)
+                    is_dup = (self._csv_has_rec(csv_path, sent, group, text)
+                              if self._dedup_on("CSV") and not has_unique_identity else False)
 
                     if not is_dup:
                         # 寫 CSV
@@ -2416,7 +2481,7 @@ class App(tk.Tk):
                         self._csv_append_row(csv_path, [sent, group, text, sender, badge])
 
                         saved_attachments: List[Path] = []
-                        for raw_url, original_name in _attachment_urls(msg.get("attachments", [])):
+                        for raw_url, original_name in attachment_refs:
                             try:
                                 file_url = urljoin(base_url, raw_url)
                                 resp = await ctx.request.get(file_url)
@@ -2441,28 +2506,31 @@ class App(tk.Tk):
                         self._push_from_worker({"type":"log","text":f"[INFO] 顯示通知 → {title} | {text[:24]}...\n"})
                         try:
                             self._push_from_worker({"type":"log","text":f"[INFO] 顯示通知 → {title} | {text[:28]}...\n"})
-                            notifier.notify(title, f"{text}\n{sent}") if not self._sent_done('notify', group, text) else None
-                            self._sent_mark('notify', group, text)
+                            notifier.notify(title, f"{text}\n{sent}") if not self._sent_done('notify', group, delivery_key) else None
+                            self._sent_mark('notify', group, delivery_key)
                             self._sent_log_row(sent, group, text, 'notify')
                         except Exception as e:
                             self._push_from_worker({"type":"log","text":f"[WARN] 通知顯示失敗: {e}\n"})
                         # Telegram 轉發
-                        tg2 = self._build_tg(self._gather_cfg())
-                        if tg2.enabled:
-                            self._push_from_worker({"type":"log","text":f"[INFO] Telegram 送出 → {group}: {text[:28]}... (parse={tg2.parse_mode or 'plain'})\n"})
+                        if tg.enabled:
+                            self._push_from_worker({"type":"log","text":f"[INFO] Telegram 送出 → {group}: {text[:28]}... (parse={tg.parse_mode or 'plain'})\n"})
                             self._push_from_worker({"type":"log","text":f"[INFO] Telegram 送出 → {group}: {text[:24]}...\n"})
-                            styled = format_for_tg(group, badge, text, sent, tg2.parse_mode, sender)
+                            styled = format_for_tg(group, badge, text, sent, tg.parse_mode, sender)
                             plain  = format_for_tg(group, badge, text, sent, None, sender)
-                            if self._sent_done('tg', group, text):
+                            if self._sent_done('tg', group, delivery_key):
                                 self._push_from_worker({"type": "log", "text": "[TG][SKIP] already sent\n"})
                             else:
-                                ok = tg2.send_text(styled, fallback_plain=plain)
-                                if ok:
-                                    self._sent_mark('tg', group, text)
-                                    self._sent_log_row(sent, group, text, 'tg')
+                                text_ok = tg.send_text(styled, fallback_plain=plain) if (text or sender) else True
+                                files_ok = True
+                                if text_ok:
                                     for attachment in saved_attachments:
-                                        if not tg2.send_file(attachment, caption=f"{group}\n{attachment.name}"):
+                                        if not tg.send_file(attachment, caption=f"{group}\n{attachment.name}"):
+                                            files_ok = False
                                             self._push_from_worker({"type": "log", "text": f"[FILE][WARN] Telegram upload failed; kept local: {attachment}\n"})
+                                ok = text_ok and files_ok
+                                if ok:
+                                    self._sent_mark('tg', group, delivery_key)
+                                    self._sent_log_row(sent, group, text, 'tg')
                                 else:
                                     self._push_from_worker({"type": "log", "text": "[WARN] Telegram 轉發失敗，未標記為已送出，後續事件會重試\n"})
                     else:
