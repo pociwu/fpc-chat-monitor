@@ -10,11 +10,17 @@
   },
   "browser": {
     "headless": false,
-    "storage_state_file": "fpc_state.json"
+    "storage_state_file": "fpc_state.json",
+    "viewport": {
+      "width": 1536,
+      "height": 864
+    }
   },
   "watch": {
     "out_dir": "local_verification",
-    "debug": true
+    "debug": true,
+    "attachment_retention_days": 7,
+    "attachment_cleanup_interval_hours": 24
   },
   "telegram": {
     "enabled": false,

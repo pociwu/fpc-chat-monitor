@@ -14,6 +14,13 @@ class WebautoLauncherContractTests(unittest.TestCase):
         self.assertIn('for candidate in fpc_watch_ui_login_telegram_*.py', source)
         self.assertIn('mv -- "$candidate" "$destination"', source)
 
+    def test_recovers_previous_tracked_version_after_git_pull(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("git ls-tree", source)
+        self.assertIn('git show "HEAD^:$previous"', source)
+        self.assertIn('"$HISTORY_DIR/$previous"', source)
+
     def test_refuses_to_fall_back_to_a_legacy_filename(self):
         source = SCRIPT.read_text(encoding="utf-8")
         self.assertIn("no versioned program found", source)

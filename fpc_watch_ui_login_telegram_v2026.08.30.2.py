@@ -83,6 +83,7 @@ import logging
 import threading
 import traceback
 import hashlib
+import stat
 from urllib.parse import urlparse, urljoin, quote, parse_qsl, urlencode, urlunparse
 from pathlib import Path
 from datetime import datetime
@@ -90,6 +91,23 @@ from typing import Dict, Optional, List, Tuple
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+
+
+def _enable_windows_dpi_awareness() -> None:
+    """Request DPI-aware screen metrics before the first Tk root is created."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+_enable_windows_dpi_awareness()
 
 # ---------- Windows asyncio 可靠化 ----------
 def _log_boot(msg: str):
@@ -131,7 +149,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 BASE = Path(__file__).resolve().parent
 CONFIG_PATH = BASE / "config.json"
-APP_VERSION = "v2026.08.30.1"
+APP_VERSION = "v2026.08.30.2"
 
 def one_line(s: str, keep_newline: bool = False) -> str:
     if not s:
@@ -141,6 +159,120 @@ def one_line(s: str, keep_newline: bool = False) -> str:
         return "\n".join(line.strip() for line in s.split("\n"))
     else:
         return re.sub(r"\s+", " ", s).strip()
+
+
+def _responsive_ui_metrics(screen_width: int, screen_height: int, dpi: float = 96.0) -> Dict[str, object]:
+    """Return deterministic Tk/browser sizing that stays inside the current screen."""
+    screen_width = max(640, int(screen_width or 0))
+    screen_height = max(480, int(screen_height or 0))
+    dpi = max(50.0, min(300.0, float(dpi or 96.0)))
+    pixel_ratio = max(0.75, min(2.5, dpi / 96.0))
+    logical_width = screen_width / pixel_ratio
+    logical_height = screen_height / pixel_ratio
+    density = max(0.70, min(1.35, min(logical_width / 1920, logical_height / 1080)))
+    window_width = max(640, min(round(1600 * pixel_ratio), screen_width - round(40 * pixel_ratio)))
+    window_height = max(480, min(round(1000 * pixel_ratio), screen_height - round(80 * pixel_ratio)))
+    compact = (window_width / pixel_ratio) < 1280 or (window_height / pixel_ratio) < 760
+    font_size = max(10, min(15, round(12 * density)))
+    group_column_width = max(170, int(window_width * (0.23 if compact else 0.25)))
+    badge_column_width = max(48, int(56 * density))
+    time_column_width = max(120, int(window_width * 0.13))
+    forward_column_width = max(48, int(58 * density))
+    message_content_width = max(
+        300,
+        window_width - group_column_width - badge_column_width
+        - time_column_width - forward_column_width - 130,
+    )
+    return {
+        "window_width": window_width,
+        "window_height": window_height,
+        "font_size": font_size,
+        "small_font_size": max(9, font_size - 1),
+        "tk_scaling": max(1.0, min(2.5, dpi / 72.0)),
+        "pixel_ratio": pixel_ratio,
+        "compact": compact,
+        "padding": 4 if compact else 8,
+        "entry_width": 24 if compact else 38,
+        "group_column_width": group_column_width,
+        "badge_column_width": badge_column_width,
+        "time_column_width": time_column_width,
+        "message_content_width": message_content_width,
+        "forward_column_width": forward_column_width,
+        "browser_width": 1536,
+        "browser_height": 864,
+        "tree_row_height": max(24, int(font_size * max(1.0, min(2.5, dpi / 72.0)) * 1.4)),
+        "log_height": 7 if compact else 12,
+    }
+
+
+def _cleanup_expired_attachments(out_dir: Path, retention_days: int, now: Optional[float] = None) -> Dict[str, object]:
+    """Delete only expired regular files below ``out_dir/attachments``.
+
+    A non-positive retention disables cleanup. Symlinks and anything outside the
+    attachment root are always skipped.
+    """
+    result: Dict[str, object] = {
+        "enabled": int(retention_days or 0) > 0,
+        "removed_files": 0,
+        "removed_dirs": 0,
+        "removed_bytes": 0,
+        "errors": [],
+    }
+    if not result["enabled"]:
+        return result
+    attachment_root = Path(out_dir) / "attachments"
+    if not attachment_root.is_dir():
+        return result
+    try:
+        root_lstat = attachment_root.lstat()
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        if attachment_root.is_symlink() or (
+                reparse_flag and getattr(root_lstat, "st_file_attributes", 0) & reparse_flag):
+            result["errors"].append("attachment root is a symlink or reparse point")
+            return result
+        out_dir_resolved = Path(out_dir).resolve(strict=True)
+        root_resolved = attachment_root.resolve(strict=True)
+        root_resolved.relative_to(out_dir_resolved)
+    except OSError as exc:
+        result["errors"].append(str(exc))
+        return result
+    except ValueError:
+        result["errors"].append("attachment root resolves outside output directory")
+        return result
+    cutoff = (time.time() if now is None else float(now)) - int(retention_days) * 86400
+    directories: List[Path] = []
+    try:
+        for path in attachment_root.rglob("*"):
+            try:
+                if path.is_symlink():
+                    continue
+                resolved = path.resolve(strict=True)
+                resolved.relative_to(root_resolved)
+                if path.is_dir():
+                    directories.append(path)
+                    continue
+                if not path.is_file() or path.stat().st_mtime >= cutoff:
+                    continue
+                size = path.stat().st_size
+                path.unlink()
+                result["removed_files"] += 1
+                result["removed_bytes"] += size
+            except (OSError, ValueError) as exc:
+                result["errors"].append(str(exc))
+    except OSError as exc:
+        result["errors"].append(str(exc))
+    for directory in sorted(directories, key=lambda item: len(item.parts), reverse=True):
+        try:
+            directory.rmdir()
+            result["removed_dirs"] += 1
+        except OSError:
+            pass
+    return result
+
+
+def _safe_attachment_component(value: str, fallback: str = "attachment") -> str:
+    cleaned = re.sub(r'[\\/:*?"<>|]+', "_", one_line(value or "")).strip().strip(".")[:140]
+    return cleaned if cleaned and cleaned not in {".", ".."} else fallback
 
 def _network_message_candidates(payload, source: str = "", channel_names: Optional[Dict[str, str]] = None) -> List[Dict]:
     """從 API/WebSocket JSON 取出可能的訊息物件；未知欄位保留在 raw 供診斷。"""
@@ -431,6 +563,13 @@ class FloatingService:
         root.withdraw()
         screen_w = root.winfo_screenwidth()
         screen_h = root.winfo_screenheight()
+        try:
+            popup_metrics = _responsive_ui_metrics(screen_w, screen_h, float(root.winfo_fpixels("1i")))
+        except Exception:
+            popup_metrics = _responsive_ui_metrics(screen_w, screen_h)
+        popup_font_size = int(popup_metrics["small_font_size"])
+        self.width = max(260, min(420, int(screen_w * 0.24)))
+        self.height = max(90, min(150, int(screen_h * 0.13)))
         popups = []
 
         def reflow():
@@ -474,14 +613,19 @@ class FloatingService:
                     frame = tk.Frame(win, bg="#ffffe0", bd=1, relief="solid")
                     frame.pack(fill="both", expand=True)
                     tk.Label(frame, text=title, bg="#ffffe0", anchor="w", justify="left",
-                             font=("Segoe UI", 9, "bold")).pack(fill="x", padx=8, pady=(6, 0))
+                             wraplength=self.width - 30,
+                             font=("Segoe UI", popup_font_size, "bold")).pack(fill="x", padx=8, pady=(6, 0))
                     tk.Label(frame, text=msg, bg="#ffffe0", anchor="w", justify="left",
-                             font=("Segoe UI", 9)).pack(fill="both", expand=True, padx=8, pady=(2, 6))
+                             wraplength=self.width - 24,
+                             font=("Segoe UI", popup_font_size)).pack(fill="both", expand=True, padx=8, pady=(2, 6))
                     tk.Button(
                         frame, text="✖", bd=0, relief="flat", bg="#ffffe0",
                         activebackground="#ffe4e1", command=lambda w=win: close_popup(w)
                     ).place(relx=1.0, rely=0.0, x=-4, y=4, anchor="ne")
                     popups.append(win)
+                    max_visible = max(1, (screen_h - self.bottom_margin) // (self.height + self.gap))
+                    while len(popups) > max_visible:
+                        close_popup(popups[0])
                     reflow()
                     if self.auto_close_ms and self.auto_close_ms > 0:
                         win.after(self.auto_close_ms, lambda w=win: close_popup(w))
@@ -774,6 +918,19 @@ async def auto_login(page, cfg: Dict, notifier: 'Notifier'):
 async def ensure_logged_in(p, cfg: Dict, notifier: 'Notifier', base_url: str, login_url: str, storage_state_file: Path, headless: bool):
     force_relogin = bool(cfg.get("login", {}).get("force_relogin", False))
     use_storage = storage_state_file.exists() and not force_relogin
+    browser_cfg = cfg.get("browser", {}) or {}
+    viewport = browser_cfg.get("viewport") or {"width": 1536, "height": 864}
+    viewport = {
+        "width": max(800, int(viewport.get("width", 1536))),
+        "height": max(600, int(viewport.get("height", 864))),
+    }
+    context_options = {
+        "storage_state": str(storage_state_file) if use_storage else None,
+        "locale": "zh-TW",
+        "timezone_id": "Asia/Taipei",
+        "viewport": viewport,
+        "color_scheme": "light",
+    }
     if headless:
         br = await p.chromium.launch(
             headless=True,
@@ -787,12 +944,8 @@ async def ensure_logged_in(p, cfg: Dict, notifier: 'Notifier', base_url: str, lo
               "AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/126.0.0.0 Safari/537.36")
         ctx = await br.new_context(
-            storage_state=str(storage_state_file) if use_storage else None,
+            **context_options,
             user_agent=ua,
-            locale="zh-TW",
-            timezone_id="Asia/Taipei",
-            viewport={"width": 1536, "height": 864},
-            color_scheme="light",
             extra_http_headers={"Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7"},
         )
         await ctx.add_init_script("""
@@ -813,8 +966,11 @@ async def ensure_logged_in(p, cfg: Dict, notifier: 'Notifier', base_url: str, lo
         except Exception:
             pass
     else:
-        br = await p.chromium.launch(headless=False)
-        ctx = await br.new_context(storage_state=str(storage_state_file) if use_storage else None)
+        br = await p.chromium.launch(
+            headless=False,
+            args=[f"--window-size={viewport['width']},{viewport['height']}"]
+        )
+        ctx = await br.new_context(**context_options)
     pg = await ctx.new_page()
 
     async def at_login():
@@ -1037,8 +1193,14 @@ class App(tk.Tk):
         self._stop_flag = False
         self._ui_paused = False
         super().__init__()
-        self.tk.call("tk", "scaling", 2.0)
-        # Linux／OCI 高解析度畫面放大
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        try:
+            dpi = float(self.winfo_fpixels("1i"))
+        except Exception:
+            dpi = 96.0
+        self.ui_metrics = _responsive_ui_metrics(screen_width, screen_height, dpi)
+        self.tk.call("tk", "scaling", self.ui_metrics["tk_scaling"])
         import tkinter.font as tkfont
         for font_name in (
             "TkDefaultFont",
@@ -1053,11 +1215,21 @@ class App(tk.Tk):
         ):
             try:
                 font = tkfont.nametofont(font_name)
-                font.configure(size=18)
+                size = (self.ui_metrics["small_font_size"]
+                        if font_name in {"TkFixedFont", "TkSmallCaptionFont", "TkTooltipFont"}
+                        else self.ui_metrics["font_size"])
+                font.configure(size=size)
             except Exception:
                 pass
         self.title(f"FPC Watch（聊天室逐則訊息・高保真） | {APP_VERSION}")
-        self.geometry("1600x1000")
+        window_width = int(self.ui_metrics["window_width"])
+        window_height = int(self.ui_metrics["window_height"])
+        pos_x = max(0, (screen_width - window_width) // 2)
+        pos_y = max(0, (screen_height - window_height) // 2)
+        self.geometry(f"{window_width}x{window_height}+{pos_x}+{pos_y}")
+        self.minsize(min(800, window_width), min(520, window_height))
+        style = ttk.Style(self)
+        style.configure("Treeview", rowheight=int(self.ui_metrics["tree_row_height"]))
 
         self.ui_queue = queue.Queue()
         self.worker_thread: Optional[threading.Thread] = None
@@ -1072,27 +1244,56 @@ class App(tk.Tk):
         self._notifier_inst: Optional[Notifier] = None
 
         # ===== 頂部工具列 =====
+        padding = int(self.ui_metrics["padding"])
         top = ttk.Frame(self)
-        top.pack(fill=tk.X, padx=10, pady=8)
+        top.pack(fill=tk.X, padx=padding, pady=padding)
+        top.grid_columnconfigure(0, weight=1)
+        action_row = ttk.Frame(top)
+        action_row.grid(row=0, column=0, sticky="w")
+        path_row = ttk.Frame(top)
+        path_row.grid(row=1, column=0, sticky="ew", pady=(padding, 0))
+        path_row.grid_columnconfigure(1, weight=1)
 
         self.var_outdir = tk.StringVar(value=str((BASE / "scraped_chats").resolve()))
         self.var_headless = tk.BooleanVar(value=False)
 
-        ttk.Button(top, text="開始監控", command=self.start_watch).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(top, text="停止", command=self.stop_watch).pack(side=tk.LEFT, padx=(0, 14))
-        ttk.Button(top, text="重新載入設定", command=self.reload_settings).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(top, text="儲存設定",   command=self._save_all_settings).pack(side=tk.LEFT, padx=(0, 14))
+        ttk.Button(action_row, text="開始監控", command=self.start_watch).pack(side=tk.LEFT, padx=(0, padding))
+        ttk.Button(action_row, text="停止", command=self.stop_watch).pack(side=tk.LEFT, padx=(0, padding))
+        ttk.Button(action_row, text="重新載入設定", command=self.reload_settings).pack(side=tk.LEFT, padx=(0, padding))
+        ttk.Button(action_row, text="儲存設定", command=self._save_all_settings).pack(side=tk.LEFT)
 
-        ttk.Label(top, text="輸出資料夾").pack(side=tk.LEFT)
-        ttk.Entry(top, textvariable=self.var_outdir, width=45).pack(side=tk.LEFT, padx=6)
-        ttk.Button(top, text="選擇...", command=self.browse_out).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Checkbutton(top, text="Headless", variable=self.var_headless).pack(side=tk.LEFT, padx=6)
+        ttk.Label(path_row, text="輸出資料夾").grid(row=0, column=0, sticky="w")
+        ttk.Entry(path_row, textvariable=self.var_outdir).grid(row=0, column=1, sticky="ew", padx=padding)
+        ttk.Button(path_row, text="選擇...", command=self.browse_out).grid(row=0, column=2, padx=(0, padding))
+        ttk.Checkbutton(path_row, text="Headless", variable=self.var_headless).grid(row=0, column=3, sticky="w")
 
         # ===== Notebook =====
         self.nb = ttk.Notebook(self)
-        self.nb.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self.nb.pack(fill=tk.BOTH, expand=True, padx=padding, pady=(0, padding))
         self.tab_monitor = ttk.Frame(self.nb)
         self.nb.add(self.tab_monitor, text="監控台")
+        self.monitor_canvas = tk.Canvas(self.tab_monitor, highlightthickness=0)
+        self.monitor_scroll_y = ttk.Scrollbar(self.tab_monitor, orient="vertical", command=self.monitor_canvas.yview)
+        self.monitor_scroll_x = ttk.Scrollbar(self.tab_monitor, orient="horizontal", command=self.monitor_canvas.xview)
+        self.monitor_canvas.configure(
+            yscrollcommand=self.monitor_scroll_y.set,
+            xscrollcommand=self.monitor_scroll_x.set,
+        )
+        self.monitor_scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
+        self.monitor_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+        self.monitor_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.monitor_body = ttk.Frame(self.monitor_canvas)
+        self._monitor_window = self.monitor_canvas.create_window((0, 0), window=self.monitor_body, anchor="nw")
+        self.monitor_body.bind(
+            "<Configure>",
+            lambda _event: self.monitor_canvas.configure(scrollregion=self.monitor_canvas.bbox("all")),
+        )
+        self.monitor_canvas.bind(
+            "<Configure>",
+            lambda event: self.monitor_canvas.itemconfigure(
+                self._monitor_window, width=max(event.width, self.monitor_body.winfo_reqwidth())
+            ),
+        )
         self.tab_groups = ttk.Frame(self.nb)
         self.nb.add(self.tab_groups, text="群組訊息")
         # ---- 去重分頁 ----
@@ -1111,7 +1312,7 @@ class App(tk.Tk):
 
 
         # ---- 監控台：登入設定 ----
-        lg = ttk.LabelFrame(self.tab_monitor, text="登入設定")
+        lg = ttk.LabelFrame(self.monitor_body, text="登入設定")
         lg.pack(fill=tk.X, padx=0, pady=6)
         self.var_base = tk.StringVar()
         self.var_login = tk.StringVar()
@@ -1119,34 +1320,35 @@ class App(tk.Tk):
         self.var_pwd = tk.StringVar()
         self.var_force = tk.BooleanVar(value=False)
         ttk.Label(lg, text="Base URL").grid(row=0, column=0, sticky="e")
-        ttk.Entry(lg, textvariable=self.var_base, width=45).grid(row=0, column=1, sticky="w", padx=6, pady=4)
+        entry_width = int(self.ui_metrics["entry_width"])
+        ttk.Entry(lg, textvariable=self.var_base, width=entry_width).grid(row=0, column=1, sticky="ew", padx=6, pady=4)
         ttk.Label(lg, text="Login URL").grid(row=0, column=2, sticky="e")
-        ttk.Entry(lg, textvariable=self.var_login, width=45).grid(row=0, column=3, sticky="w", padx=6, pady=4)
+        ttk.Entry(lg, textvariable=self.var_login, width=entry_width).grid(row=0, column=3, sticky="ew", padx=6, pady=4)
         ttk.Label(lg, text="帳號").grid(row=1, column=0, sticky="e")
-        ttk.Entry(lg, textvariable=self.var_user, width=30).grid(row=1, column=1, sticky="w", padx=6)
+        ttk.Entry(lg, textvariable=self.var_user, width=entry_width).grid(row=1, column=1, sticky="ew", padx=6)
         ttk.Label(lg, text="密碼").grid(row=1, column=2, sticky="e")
-        ttk.Entry(lg, textvariable=self.var_pwd, show="*", width=30).grid(row=1, column=3, sticky="w", padx=6)
+        ttk.Entry(lg, textvariable=self.var_pwd, show="*", width=entry_width).grid(row=1, column=3, sticky="ew", padx=6)
         self.var_u_sel = tk.StringVar()
         self.var_p_sel = tk.StringVar()
         self.var_s_sel = tk.StringVar()
         self.var_wait = tk.IntVar(value=12)
         ttk.Label(lg, text="帳號 selector").grid(row=2, column=0, sticky="e")
-        ttk.Entry(lg, textvariable=self.var_u_sel, width=45).grid(row=2, column=1, sticky="w", padx=6)
+        ttk.Entry(lg, textvariable=self.var_u_sel, width=entry_width).grid(row=2, column=1, sticky="ew", padx=6)
         ttk.Label(lg, text="密碼 selector").grid(row=2, column=2, sticky="e")
-        ttk.Entry(lg, textvariable=self.var_p_sel, width=45).grid(row=2, column=3, sticky="w", padx=6)
+        ttk.Entry(lg, textvariable=self.var_p_sel, width=entry_width).grid(row=2, column=3, sticky="ew", padx=6)
         ttk.Label(lg, text="送出 selector").grid(row=3, column=0, sticky="e")
-        ttk.Entry(lg, textvariable=self.var_s_sel, width=45).grid(row=3, column=1, sticky="w", padx=6)
+        ttk.Entry(lg, textvariable=self.var_s_sel, width=entry_width).grid(row=3, column=1, sticky="ew", padx=6)
         ttk.Label(lg, text="成功等待秒").grid(row=3, column=2, sticky="e")
         ttk.Entry(lg, textvariable=self.var_wait, width=10).grid(row=3, column=3, sticky="w", padx=6)
         ttk.Checkbutton(lg, text="強制重登（忽略 fpc_state.json）", variable=self.var_force).grid(row=4, column=1, sticky="w", padx=6, pady=4)
-        for i in range(4):
-            lg.grid_columnconfigure(i, weight=1)
+        lg.grid_columnconfigure(1, weight=1)
+        lg.grid_columnconfigure(3, weight=1)
 
         # ---- 通知 ----
-        ui = ttk.LabelFrame(self.tab_monitor, text="通知")
+        ui = ttk.LabelFrame(self.monitor_body, text="通知")
         ui.pack(fill=tk.X, padx=0, pady=6)
         # ---- 去重功能 ----
-        dd = ttk.LabelFrame(self.tab_monitor, text="去重功能")
+        dd = ttk.LabelFrame(self.monitor_body, text="去重功能")
         dd.pack(fill=tk.X, padx=0, pady=6)
         self.var_dedup_master = tk.BooleanVar(value=False)
         self.var_dedup_js = tk.BooleanVar(value=False)
@@ -1161,7 +1363,7 @@ class App(tk.Tk):
             dd.grid_columnconfigure(i, weight=1)
 
         # ---- 工具：聊天室 DOM 快照 ----
-        tool = ttk.LabelFrame(self.tab_monitor, text="診斷工具")
+        tool = ttk.LabelFrame(self.monitor_body, text="診斷工具")
         tool.pack(fill=tk.X, padx=0, pady=6)
         ttk.Button(tool, text="Dump 聊天室 DOM", command=self._request_dump_dom).grid(row=0, column=0, sticky="w", padx=6, pady=6)
         ttk.Label(tool, text="（產生 dom_dump/YYMMDD_HHMMSS.html）").grid(row=0, column=1, sticky="w", padx=6)
@@ -1180,7 +1382,7 @@ class App(tk.Tk):
                    ).grid(row=0, column=4, sticky="w", padx=8)
 
         # ---- Telegram ----
-        tg = ttk.LabelFrame(self.tab_monitor, text="Telegram 轉發")
+        tg = ttk.LabelFrame(self.monitor_body, text="Telegram 轉發")
         tg.pack(fill=tk.X, padx=0, pady=6)
         self.var_tg_enable = tk.BooleanVar(value=True)
         self.var_tg_token = tk.StringVar()
@@ -1193,9 +1395,9 @@ class App(tk.Tk):
         self.var_tg_announce = tk.BooleanVar(value=True)
         ttk.Checkbutton(tg, text="啟用", variable=self.var_tg_enable).grid(row=0, column=0, sticky="w", padx=6)
         ttk.Label(tg, text="Bot Token").grid(row=0, column=1, sticky="e")
-        ttk.Entry(tg, textvariable=self.var_tg_token, width=45).grid(row=0, column=2, sticky="w", padx=6)
+        ttk.Entry(tg, textvariable=self.var_tg_token, width=entry_width).grid(row=0, column=2, sticky="ew", padx=6)
         ttk.Label(tg, text="Chat ID").grid(row=0, column=3, sticky="e")
-        ttk.Entry(tg, textvariable=self.var_tg_chatid, width=30).grid(row=0, column=4, sticky="w", padx=6)
+        ttk.Entry(tg, textvariable=self.var_tg_chatid, width=max(14, entry_width - 6)).grid(row=0, column=4, sticky="ew", padx=6)
         ttk.Label(tg, text="Parse").grid(row=1, column=1, sticky="e")
         ttk.Combobox(tg, textvariable=self.var_tg_parse, values=("", "HTML", "MarkdownV2"),
                      state="readonly", width=12).grid(row=1, column=2, sticky="w", padx=6)
@@ -1208,8 +1410,23 @@ class App(tk.Tk):
         ttk.Label(tg, text="節流ms").grid(row=2, column=5, sticky="e")
         ttk.Entry(tg, textvariable=self.var_tg_rl_ms, width=8).grid(row=2, column=6, sticky="w")
         ttk.Checkbutton(tg, text="啟動時公告", variable=self.var_tg_announce).grid(row=2, column=0, sticky="w", padx=6)
-        for i in range(7):
-            tg.grid_columnconfigure(i, weight=1)
+        tg.grid_columnconfigure(2, weight=1)
+        tg.grid_columnconfigure(4, weight=1)
+
+        # ---- 附件暫存 ----
+        attachment_box = ttk.LabelFrame(self.monitor_body, text="附件暫存")
+        attachment_box.pack(fill=tk.X, padx=0, pady=6)
+        self.var_attachment_retention_days = tk.IntVar(value=7)
+        self.var_attachment_cleanup_hours = tk.IntVar(value=24)
+        ttk.Label(attachment_box, text="保留天數（0=停用清理）").grid(row=0, column=0, sticky="e", padx=6, pady=4)
+        ttk.Spinbox(attachment_box, from_=0, to=3650, textvariable=self.var_attachment_retention_days,
+                    width=8).grid(row=0, column=1, sticky="w", padx=6)
+        ttk.Label(attachment_box, text="清理間隔（小時）").grid(row=0, column=2, sticky="e", padx=6)
+        ttk.Spinbox(attachment_box, from_=1, to=168, textvariable=self.var_attachment_cleanup_hours,
+                    width=8).grid(row=0, column=3, sticky="w", padx=6)
+        ttk.Label(attachment_box, text="只清除輸出資料夾內 attachments/ 的過期檔案").grid(
+            row=0, column=4, sticky="w", padx=6)
+        attachment_box.grid_columnconfigure(4, weight=1)
 
         # ---- 群組訊息分頁 ----
         left = ttk.Frame(self.tab_groups)
@@ -1221,8 +1438,8 @@ class App(tk.Tk):
         self.tree_scroll_y.config(command=self.tree.yview)
         self.tree.heading("#0", text="名稱")
         self.tree.heading("badge", text="未讀")
-        self.tree.column("#0", width=320)
-        self.tree.column("badge", width=60, anchor="center")
+        self.tree.column("#0", width=int(self.ui_metrics["group_column_width"]))
+        self.tree.column("badge", width=int(self.ui_metrics["badge_column_width"]), anchor="center", stretch=False)
         self.tree.pack(side=tk.LEFT, fill=tk.Y)
         self.tree_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.bind("<<TreeviewSelect>>", self.on_group_select)
@@ -1243,9 +1460,9 @@ class App(tk.Tk):
         self.tv_msg.heading("time", text="時間")
         self.tv_msg.heading("content", text="內容")
         self.tv_msg.heading("fwd", text="轉發")
-        self.tv_msg.column("time", width=160, anchor="w")
-        self.tv_msg.column("content", width=560, anchor="w")
-        self.tv_msg.column("fwd", width=60, anchor="center")
+        self.tv_msg.column("time", width=int(self.ui_metrics["time_column_width"]), anchor="w", stretch=False)
+        self.tv_msg.column("content", width=int(self.ui_metrics["message_content_width"]), anchor="w", stretch=True)
+        self.tv_msg.column("fwd", width=int(self.ui_metrics["forward_column_width"]), anchor="center", stretch=False)
         self.tv_msg.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         # 轉發欄位樣式：✓(綠) / ✗(橙)
         try:
@@ -1255,6 +1472,7 @@ class App(tk.Tk):
             pass
 
         self.grp_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tab_groups.bind("<Configure>", self._resize_group_columns)
 
         # ---- 載入設定 ----
         self._load_all_settings()
@@ -1368,9 +1586,19 @@ class App(tk.Tk):
 
         br = cfg.get("browser", {}) or {}
         self.var_headless.set(bool(br.get("headless", False)))
+        raw_viewport = br.get("viewport") or {"width": 1536, "height": 864}
+        try:
+            self.browser_viewport = {
+                "width": max(800, int(raw_viewport.get("width", 1536))),
+                "height": max(600, int(raw_viewport.get("height", 864))),
+            }
+        except (AttributeError, TypeError, ValueError):
+            self.browser_viewport = {"width": 1536, "height": 864}
 
         watch = cfg.get("watch", {}) or {}
         self.var_outdir.set(str(Path(watch.get("out_dir", "scraped_chats")).resolve()))
+        self.var_attachment_retention_days.set(max(0, int(watch.get("attachment_retention_days", 7))))
+        self.var_attachment_cleanup_hours.set(max(1, int(watch.get("attachment_cleanup_interval_hours", 24))))
 
         # 側欄（群組列表）選擇器
         sels = (watch.get("selectors") or {})
@@ -1426,13 +1654,19 @@ class App(tk.Tk):
                 "login_success_wait_sec": int(self.var_wait.get()),
                 "force_relogin": bool(self.var_force.get()),
             },
-            "browser": {"headless": bool(self.var_headless.get()), "storage_state_file": "fpc_state.json"},
+            "browser": {
+                "headless": bool(self.var_headless.get()),
+                "storage_state_file": "fpc_state.json",
+                "viewport": dict(getattr(self, "browser_viewport", {"width": 1536, "height": 864})),
+            },
             "ui": {"popup_mode": self.var_popup.get(), "auto_close_sec": int(self.var_auto_close.get())},
             "watch": {
                 "out_dir": str(Path(self.var_outdir.get()).resolve()),
                 "debounce_ms": int(self.debounce_ms),
                 "poll_ms": int(self.poll_ms),
                 "debug": bool(self.debug_flag),
+                "attachment_retention_days": max(0, int(self.var_attachment_retention_days.get())),
+                "attachment_cleanup_interval_hours": max(1, int(self.var_attachment_cleanup_hours.get())),
                 "selectors": {
                     "group_row": self.sel_group_row,
                     "badge": self.sel_badge,
@@ -1521,6 +1755,21 @@ class App(tk.Tk):
             self.log_sys(f"[ERROR] 寫入 CSV 失敗：{e}\n")
 
     # ---------- UI 輔助 ----------
+    def _resize_group_columns(self, event):
+        """Keep group/message columns readable as the main window is resized."""
+        available = max(640, int(getattr(event, "width", 0) or self.winfo_width()))
+        badge_width = int(self.ui_metrics["badge_column_width"])
+        group_area = max(220, min(460, int(available * 0.30)))
+        self.tree.column("#0", width=max(160, group_area - badge_width - 28))
+        self.tree.column("badge", width=badge_width)
+        message_area = max(360, available - group_area - 48)
+        time_width = max(120, min(190, int(message_area * 0.22)))
+        forward_width = int(self.ui_metrics["forward_column_width"])
+        content_width = max(220, message_area - time_width - forward_width - 28)
+        self.tv_msg.column("time", width=time_width)
+        self.tv_msg.column("content", width=content_width)
+        self.tv_msg.column("fwd", width=forward_width)
+
     def browse_out(self):
         p = filedialog.askdirectory(title="選擇輸出資料夾")
         if p:
@@ -1814,6 +2063,27 @@ class App(tk.Tk):
         out_dir = Path(watch.get("out_dir", "scraped_chats"))
         out_dir.mkdir(parents=True, exist_ok=True)
         self._push_from_worker({"type": "log", "text": f"[INFO] Version: {APP_VERSION}\n"})
+        attachment_retention_days = max(0, int(watch.get("attachment_retention_days", 7)))
+        attachment_cleanup_hours = max(1, int(watch.get("attachment_cleanup_interval_hours", 24)))
+
+        async def run_attachment_cleanup() -> float:
+            try:
+                if attachment_retention_days <= 0:
+                    self._push_from_worker({"type": "log", "text": "[FILE] attachment cleanup disabled\n"})
+                else:
+                    result = await asyncio.to_thread(
+                        _cleanup_expired_attachments, out_dir, attachment_retention_days
+                    )
+                    self._push_from_worker({"type": "log", "text":
+                        f"[FILE] attachment cleanup: removed={result['removed_files']}, "
+                        f"bytes={result['removed_bytes']}, retention={attachment_retention_days}d, "
+                        f"errors={len(result['errors'])}\n"})
+            except Exception as exc:
+                self._push_from_worker({"type": "log", "text":
+                    f"[FILE][WARN] attachment cleanup failed; monitoring continues: {exc}\n"})
+            return time.monotonic() + attachment_cleanup_hours * 3600
+
+        next_attachment_cleanup_at = await run_attachment_cleanup()
 
         # CSV 異動：訊息模式另存 messages_YYYYMMDD.csv
         def today_csv() -> Path:
@@ -2237,6 +2507,8 @@ class App(tk.Tk):
 
             try:
                 while True:
+                    if time.monotonic() >= next_attachment_cleanup_at:
+                        next_attachment_cleanup_at = await run_attachment_cleanup()
                     # 若 UI 要求 Dump DOM，抓取聊天面板或整頁 HTML
                     if self._want_dump_dom:
                         try:
@@ -2488,11 +2760,15 @@ class App(tk.Tk):
                                 if not resp.ok:
                                     raise RuntimeError(f"HTTP {resp.status}")
                                 body = await resp.body()
-                                safe_group = re.sub(r'[\\/:*?"<>|]+', "_", group or "unknown")[:80]
-                                folder = out_dir / "attachments" / safe_group / datetime.now().strftime("%Y%m%d")
+                                attachment_root = (out_dir / "attachments").resolve()
+                                safe_group = _safe_attachment_component(group, "unknown")[:80]
+                                folder = attachment_root / safe_group / datetime.now().strftime("%Y%m%d")
+                                folder.resolve().relative_to(attachment_root)
                                 folder.mkdir(parents=True, exist_ok=True)
                                 parsed_name = Path(urlparse(file_url).path).name
-                                base_name = re.sub(r'[\\/:*?"<>|]+', "_", original_name or parsed_name or "attachment")
+                                base_name = _safe_attachment_component(
+                                    original_name or parsed_name or "attachment", "attachment"
+                                )
                                 dest = folder / f"{hashlib.sha256(body).hexdigest()[:12]}_{base_name[:140]}"
                                 if not dest.exists():
                                     dest.write_bytes(body)
@@ -2551,14 +2827,32 @@ class App(tk.Tk):
 def main():
     app = App()
     # 系統訊息區（晚建立也 OK，供 log_sys 使用）
-    frm = ttk.Frame(app.tab_monitor)
+    frm = ttk.Frame(app.monitor_body)
     frm.pack(fill=tk.BOTH, expand=True, padx=0, pady=(0, 6))
     ttk.Label(frm, text="系統訊息").pack(anchor="w")
     app.sys_scroll = ttk.Scrollbar(frm, orient="vertical")
-    app.syslog = tk.Text(frm, height=14, yscrollcommand=app.sys_scroll.set)
+    app.syslog = tk.Text(frm, height=int(app.ui_metrics["log_height"]), yscrollcommand=app.sys_scroll.set)
     app.sys_scroll.config(command=app.syslog.yview)
     app.syslog.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     app.sys_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+    if "--ui-smoke-test" in sys.argv:
+        app.update_idletasks()
+        app.update()
+        smoke_layout = {
+            "window": [app.winfo_width(), app.winfo_height()],
+            "canvas": [app.monitor_canvas.winfo_width(), app.monitor_canvas.winfo_height()],
+            "body": [app.monitor_body.winfo_width(), app.monitor_body.winfo_height()],
+            "body_requested": [app.monitor_body.winfo_reqwidth(), app.monitor_body.winfo_reqheight()],
+        }
+        app.withdraw()
+        print(json.dumps({
+            "app_version": APP_VERSION,
+            "metrics": app.ui_metrics,
+            "layout": smoke_layout,
+            "monitor_scrollregion": app.monitor_canvas.cget("scrollregion"),
+        }, ensure_ascii=False))
+        app.destroy()
+        return
     app.mainloop()
 
 if __name__ == "__main__":

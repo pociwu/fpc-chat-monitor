@@ -26,6 +26,16 @@ fi
 latest="$(printf '%s\n' "${versioned[@]}" | sort -V | tail -n 1)"
 mkdir -p "$HISTORY_DIR"
 
+# A fast-forward pull can remove the previously tracked version before this
+# launcher runs. Recover that immediate prior version from Git into History.
+if git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+  previous="$(git ls-tree -r --name-only HEAD^ -- 'fpc_watch_ui_login_telegram_v*.py' | sort -V | tail -n 1)"
+  if [[ -n "$previous" && "$previous" != "$latest" && ! -e "$APP_DIR/$previous" && ! -e "$HISTORY_DIR/$previous" ]]; then
+    git show "HEAD^:$previous" > "$HISTORY_DIR/$previous"
+    echo "Archived from Git: $previous -> History/$previous"
+  fi
+fi
+
 for candidate in fpc_watch_ui_login_telegram_*.py; do
   [[ "$candidate" == "$latest" ]] && continue
   destination="$HISTORY_DIR/$candidate"

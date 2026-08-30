@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 
-SOURCE = Path(__file__).resolve().parents[1] / "fpc_watch_ui_login_telegram_v2026.08.30.1.py"
+SOURCE = Path(__file__).resolve().parents[1] / "fpc_watch_ui_login_telegram_v2026.08.30.2.py"
 SPEC = importlib.util.spec_from_file_location("watcher", SOURCE)
 watcher = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(watcher)
