@@ -213,7 +213,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 BASE = Path(__file__).resolve().parent
 CONFIG_PATH = BASE / "config.json"
-APP_VERSION = "v2026.08.31.1"
+APP_VERSION = "v2026.08.31.2"
 
 def one_line(s: str, keep_newline: bool = False) -> str:
     if not s:
@@ -223,6 +223,11 @@ def one_line(s: str, keep_newline: bool = False) -> str:
         return "\n".join(line.strip() for line in s.split("\n"))
     else:
         return re.sub(r"\s+", " ", s).strip()
+
+
+def _canonical_message_identity_text(value) -> str:
+    """Use the same whitespace form that CSV/UI/Telegram actually render."""
+    return one_line(value or "")
 
 
 def _responsive_ui_metrics(screen_width: int, screen_height: int, dpi: float = 96.0) -> Dict[str, object]:
@@ -484,7 +489,8 @@ def _preview_fallback_message(pending: Dict) -> Dict:
     return {
         "type": "network_msg",
         "group": one_line(pending.get("group", "")),
-        "text": one_line(pending.get("preview", "")),
+        "text": "" if pending.get("preview_uncertain")
+        else one_line(pending.get("preview", "")),
         "sender": "",
         "time": one_line(pending.get("time", "")),
         "attachments": [],
@@ -520,8 +526,165 @@ def _expand_side_preview_event(msg: Dict, group_key: str) -> List[Dict]:
             "time": one_line(msg.get("time", "")),
             "badge": badge,
             "event_token": token,
+            "preview_uncertain": bool(msg.get("preview_uncertain", False))
+                or (event_count > 1 and index < event_count - 1),
         })
     return events
+
+
+class SidebarSnapshotReducer:
+    """Turn staged sidebar DOM renders into one settled message event.
+
+    The page can render a new preview and its unread badge in either order.  A
+    direct event for each render makes one real message look like two messages.
+    Keep each unread increment, settle its staged fields, then emit it once.
+    """
+
+    SETTLE_SECONDS = 0.75
+
+    def __init__(self):
+        self._rows: Dict[str, Dict] = {}
+
+    @staticmethod
+    def _unread(value) -> int:
+        match = re.search(r"\d+", one_line(value or ""))
+        return int(match.group(0)) if match else 0
+
+    @staticmethod
+    def _normalize(snapshot: Dict) -> Dict:
+        group = one_line(snapshot.get("group", ""))
+        badge = one_line(snapshot.get("badge", ""))
+        return {
+            "type": "side_snapshot",
+            "group": group,
+            "group_key": _delivery_group_key(group),
+            "text": one_line(snapshot.get("text", "")),
+            "time": one_line(snapshot.get("time", "")),
+            "badge": badge,
+            "unread": SidebarSnapshotReducer._unread(badge),
+        }
+
+    def observe(self, snapshot: Dict, now: Optional[float] = None) -> None:
+        current = time.monotonic() if now is None else now
+        normalized = self._normalize(snapshot)
+        key = normalized["group_key"]
+        if not key or not normalized["text"]:
+            return
+        state = self._rows.get(key)
+        if state is None:
+            # A row's first observed snapshot is always a baseline. This avoids
+            # replaying old unread rows that appear later through lazy rendering.
+            self._rows[key] = {
+                "committed": normalized,
+                "pending": None,
+                "deadline": None,
+                "slots": {},
+            }
+            return
+
+        base = state["pending"] or state["committed"]
+        text_changed = normalized["text"] != base["text"]
+        unread_changed = normalized["unread"] != base["unread"]
+        if not text_changed and not unread_changed:
+            if state["pending"] is not None:
+                # Time/name can settle after preview and badge. Preserve display
+                # metadata without extending the quiet deadline forever.
+                state["pending"] = normalized
+                if normalized["unread"] in state["slots"]:
+                    state["slots"][normalized["unread"]].update(normalized)
+            else:
+                state["committed"] = normalized
+            return
+
+        if normalized["unread"] < base["unread"]:
+            # Opening/reading a group resets the unread baseline; it is not a
+            # delivery event.
+            state["slots"].clear()
+        elif normalized["unread"] > base["unread"]:
+            jump = normalized["unread"] - base["unread"]
+            for unread in range(base["unread"] + 1, normalized["unread"] + 1):
+                slot = dict(normalized)
+                slot["badge"] = str(unread)
+                # If intermediate DOM states were skipped, only the last preview
+                # is known. Never use that copied preview as a fallback.
+                slot["preview_uncertain"] = (
+                    not text_changed
+                    or (jump > 1 and unread < normalized["unread"])
+                )
+                state["slots"][unread] = slot
+        elif normalized["unread"] in state["slots"]:
+            # Badge-first staged render: replace the provisional old preview for
+            # this exact unread slot instead of creating a second event.
+            state["slots"][normalized["unread"]].update(normalized)
+            state["slots"][normalized["unread"]]["preview_uncertain"] = False
+
+        state["pending"] = normalized
+        state["deadline"] = current + self.SETTLE_SECONDS
+
+    def pop_due(self, now: Optional[float] = None) -> List[Dict]:
+        current = time.monotonic() if now is None else now
+        events: List[Dict] = []
+        for state in self._rows.values():
+            pending = state["pending"]
+            deadline = state["deadline"]
+            if pending is None or deadline is None or current < deadline:
+                continue
+            committed = state["committed"]
+            slots = [state["slots"][key] for key in sorted(state["slots"])]
+            state["committed"] = pending
+            state["pending"] = None
+            state["deadline"] = None
+            state["slots"] = {}
+
+            unread_delta = pending["unread"] - committed["unread"]
+            preview_changed = pending["text"] != committed["text"]
+            if pending["unread"] <= 0 or unread_delta < 0:
+                continue
+            # In unopened-group mode a real new message must increase unread.
+            # Preview-only changes are staged DOM renders (or row metadata), not
+            # a second delivery. Waiting for the badge also handles arbitrarily
+            # late preview->badge updates without choosing a fragile timeout.
+            if unread_delta == 0:
+                if preview_changed:
+                    # A badge-first render may already have created one pending
+                    # event with the old preview. Update that event in place;
+                    # never create a second delivery for the later preview.
+                    events.append({
+                        "type": "side_preview_update",
+                        "group": pending["group"],
+                        "text": pending["text"],
+                        "time": pending["time"],
+                        "badge": pending["badge"],
+                    })
+                continue
+            for slot in slots[-50:]:
+                event_token = "||".join((
+                    slot["group"], slot["text"], slot["time"], slot["badge"]
+                ))
+                events.append({
+                    "type": "side_preview",
+                    "group": slot["group"],
+                    "sender": "",
+                    "text": slot["text"],
+                    "time": slot["time"],
+                    "badge": slot["badge"],
+                    "event_token": event_token,
+                    "event_count": 1,
+                    "preview_uncertain": bool(slot.get("preview_uncertain", False)),
+                })
+        return events
+
+
+def _drain_sidebar_snapshot_queue(snapshot_queue, reducer: SidebarSnapshotReducer) -> int:
+    """Observe every snapshot already queued before testing reducer deadlines."""
+    drained = 0
+    while True:
+        try:
+            reducer.observe(snapshot_queue.get_nowait())
+            drained += 1
+        except asyncio.QueueEmpty:
+            return drained
+
 
 class PendingPreviewBuffer:
     """保留密集側欄事件；同群組的新事件不可覆蓋舊事件。"""
@@ -625,6 +788,36 @@ class PendingPreviewBuffer:
     def snapshot(self) -> List[Dict]:
         return list(self._items)
 
+    def snapshot_for_group(self, group_key: str) -> List[Dict]:
+        wanted = self._key(group_key)
+        return [
+            item for item in self._items
+            if self._key(item.get("group_key") or item.get("group", "")) == wanted
+        ]
+
+    def update_latest(self, group_key: str, badge: str, event: Dict) -> bool:
+        """Apply a late preview render to its existing unread event in place."""
+        wanted = self._key(group_key)
+        wanted_badge = one_line(badge)
+        for item in reversed(self._items):
+            if self._key(item.get("group_key") or item.get("group", "")) != wanted:
+                continue
+            if one_line(item.get("badge", "")) != wanted_badge:
+                continue
+            if not item.get("preview_uncertain"):
+                continue
+            item["preview"] = one_line(event.get("text", ""))
+            item["time"] = one_line(event.get("time", ""))
+            item["preview_uncertain"] = False
+            item["event_token"] = "||".join((
+                one_line(event.get("group", "")),
+                item["preview"],
+                item["time"],
+                wanted_badge,
+            ))
+            return True
+        return False
+
     def pop_expired(self, now: Optional[float] = None, max_age: float = 8) -> List[Dict]:
         current = time.time() if now is None else now
         expired = [item for item in self._items if current - item["queued_at"] >= max_age]
@@ -636,14 +829,15 @@ class MessageIngressReservations:
     """Reserve server message IDs before they can consume another sidebar event."""
 
     def __init__(self):
-        self._keys = set()
+        self._id_keys = set()
+        self._fingerprint_owners: Dict[Tuple, set] = {}
 
     @staticmethod
-    def _aliases(item: Dict) -> List[Tuple[str, str, str]]:
+    def _id_aliases(item: Dict) -> List[Tuple[str, str, str]]:
         message_id = one_line(item.get("message_id", ""))
-        if not message_id:
-            return []
         aliases: List[Tuple[str, str, str]] = []
+        if not message_id:
+            return aliases
         cid = one_line(item.get("cid", ""))
         group = _delivery_group_key(item.get("group", ""))
         if cid:
@@ -652,22 +846,89 @@ class MessageIngressReservations:
             aliases.append(("group", group, message_id))
         return aliases
 
+    @staticmethod
+    def _fingerprint_aliases(item: Dict) -> List[Tuple]:
+        cid = one_line(item.get("cid", ""))
+        group = _delivery_group_key(item.get("group", ""))
+        scopes = []
+        if cid:
+            scopes.append(("cid", cid))
+        if group:
+            scopes.append(("group", group))
+        text = _canonical_message_identity_text(item.get("text", ""))
+        attachments = _attachment_identity_urls(item.get("attachments", []))
+        if not scopes or (not text and not attachments):
+            return []
+        variants = (
+            ("strong", {
+                "text": text,
+                "time": one_line(item.get("time", "")),
+                "attachments": attachments,
+            }),
+            # Some transports omit time/message_id.  This relaxed bridge is
+            # owner-aware: different real message IDs with identical content
+            # remain distinct, while an ID/no-ID copy is suppressed.
+            ("relaxed", {"text": text, "attachments": attachments}),
+        )
+        aliases: List[Tuple] = []
+        for variant, identity in variants:
+            fingerprint = hashlib.sha256(
+                json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            for scope_kind, scope_value in scopes:
+                aliases.append(("fingerprint", variant, scope_kind, scope_value, fingerprint))
+        return aliases
+
+    @classmethod
+    def _aliases(cls, item: Dict) -> List[Tuple]:
+        return cls._id_aliases(item) + cls._fingerprint_aliases(item)
+
     def contains(self, item: Dict) -> bool:
-        aliases = self._aliases(item)
-        return bool(aliases) and any(alias in self._keys for alias in aliases)
+        message_id = one_line(item.get("message_id", ""))
+        if any(alias in self._id_keys for alias in self._id_aliases(item)):
+            return True
+        for alias in self._fingerprint_aliases(item):
+            owners = self._fingerprint_owners.get(alias, set())
+            if not message_id and owners:
+                return True
+            if message_id and ("" in owners or message_id in owners):
+                return True
+        return False
 
     def reserve(self, item: Dict) -> bool:
-        aliases = self._aliases(item)
-        if not aliases:
+        id_aliases = self._id_aliases(item)
+        fingerprint_aliases = self._fingerprint_aliases(item)
+        if not id_aliases and not fingerprint_aliases:
             return True
-        if any(alias in self._keys for alias in aliases):
+        if self.contains(item):
             return False
-        self._keys.update(aliases)
+        self._id_keys.update(id_aliases)
+        owner = one_line(item.get("message_id", ""))
+        for alias in fingerprint_aliases:
+            self._fingerprint_owners.setdefault(alias, set()).add(owner)
         return True
 
     def release(self, item: Dict) -> None:
-        for alias in self._aliases(item):
-            self._keys.discard(alias)
+        for alias in self._id_aliases(item):
+            self._id_keys.discard(alias)
+        owner = one_line(item.get("message_id", ""))
+        for alias in self._fingerprint_aliases(item):
+            owners = self._fingerprint_owners.get(alias)
+            if owners is None:
+                continue
+            owners.discard(owner)
+            if not owners:
+                self._fingerprint_owners.pop(alias, None)
+
+
+def _unique_message_candidates(items: List[Dict]) -> List[Dict]:
+    """Deduplicate transport copies without merging distinct server IDs."""
+    seen = MessageIngressReservations()
+    unique: List[Dict] = []
+    for item in items:
+        if seen.reserve(item):
+            unique.append(item)
+    return unique
 
 
 def _claim_passive_candidate(
@@ -720,25 +981,85 @@ def _claim_backfill_batch(
     group_key: str,
     candidates: List[Dict],
     reservations: MessageIngressReservations,
+    eligible_pending: Optional[List[Dict]] = None,
 ) -> List[Dict]:
-    """Pair the newest unseen server messages with dense pending events in order."""
-    pending_count = pending_groups.count_for_group(group_key)
-    if pending_count <= 0:
+    """Tail-align server results, then claim only this request's pending rows.
+
+    A newer sidebar row can appear while an HTTP backfill is in flight.  It is
+    part of the current tail alignment but is not eligible for the older
+    request, so a newest-only response cannot slide left and consume the older
+    row.
+    """
+    eligible = (pending_groups.snapshot_for_group(group_key)
+                if eligible_pending is None else eligible_pending)
+    eligible_ids = {id(item) for item in eligible}
+    current = pending_groups.snapshot_for_group(group_key)
+    if not current or not eligible_ids:
         return []
     wanted = _delivery_group_key(group_key)
-    matching = [
+    matching = _unique_message_candidates([
         item for item in candidates
         if _delivery_group_key(item.get("group", "")) == wanted
         and not reservations.contains(item)
-    ]
+    ])
+    pair_count = min(len(current), len(matching))
+    aligned = list(zip(current[-pair_count:], matching[-pair_count:]))
+    pairs: List[Tuple[Dict, Dict]] = []
+    used_targets = set()
+    for positional_target, item in aligned:
+        target = positional_target
+        if not _candidate_matches_pending(item, target):
+            compatible = [
+                pending for pending in current
+                if id(pending) not in used_targets
+                and not pending.get("preview_uncertain")
+                and _candidate_matches_pending(item, pending)
+            ]
+            # A unique text match may safely override tail position.  Ambiguous
+            # repeated photo/file notices must stay positional, otherwise a
+            # newer message can slide left into an older in-flight request.
+            if len(compatible) != 1:
+                continue
+            target = compatible[0]
+        if id(target) in used_targets:
+            continue
+        used_targets.add(id(target))
+        pairs.append((target, item))
     claimed: List[Dict] = []
-    for item in matching[-pending_count:]:
-        candidate = _claim_passive_candidate(
-            pending_groups, group_key, item, reservations
+    for target, item in pairs:
+        if id(target) not in eligible_ids:
+            continue
+        candidate = _claim_backfill_candidate(
+            pending_groups, target, item, reservations
         )
         if candidate is not None:
             claimed.append(candidate)
     return claimed
+
+
+def _candidate_matches_pending(candidate: Dict, pending: Dict) -> bool:
+    """Match full server text to the exact sidebar event that triggered it."""
+    if pending.get("preview_uncertain"):
+        return bool(
+            one_line(candidate.get("text", ""), keep_newline=True).strip()
+            or _attachment_urls(candidate.get("attachments", []))
+        )
+    preview = one_line(pending.get("preview", ""), keep_newline=True).strip()
+    text = one_line(candidate.get("text", ""), keep_newline=True).strip()
+    if not preview:
+        return False
+    if not text and _attachment_urls(candidate.get("attachments", [])):
+        return bool(re.search(
+            r"(?:傳送|傳了|sent|uploaded).*(?:照片|圖片|影像|影片|檔案|文件|附件|photo|image|video|file|document)",
+            preview,
+            re.IGNORECASE,
+        ))
+    if not text:
+        return False
+    prefix = re.sub(r"(?:\.{3}|…)$", "", preview).rstrip()
+    return bool(prefix) and (
+        text == preview or text.startswith(prefix) or preview.startswith(text)
+    )
 
 
 def _delivery_group_key(value: str) -> str:
@@ -759,12 +1080,12 @@ def _message_delivery_key(item: Dict) -> str:
         identity = {"group": group, "message_id": message_id}
         raw = json.dumps(identity, ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    attachments = _attachment_urls(item.get("attachments", []))
+    attachments = _attachment_identity_urls(item.get("attachments", []))
     identity = {
         "group": group,
         "badge": one_line(item.get("badge", "")),
         "time": one_line(item.get("time", "")),
-        "text": one_line(item.get("text", ""), keep_newline=True),
+        "text": _canonical_message_identity_text(item.get("text", "")),
         "attachments": attachments,
     }
     raw = json.dumps(identity, ensure_ascii=False, sort_keys=True)
@@ -781,6 +1102,7 @@ def _send_telegram_bundle_once(
     saved_attachments: List[Path],
     already_sent,
     mark_sent,
+    attachments_complete: bool = True,
 ) -> Tuple[str, List[Path]]:
     """Send one delivery identity at most once in the current monitor process."""
     if already_sent("tg", group, delivery_key):
@@ -796,9 +1118,15 @@ def _send_telegram_bundle_once(
     failed_attachments: List[Path] = []
     if text_ok:
         for attachment in saved_attachments:
-            attachment_digest = hashlib.sha256(
-                str(attachment).encode("utf-8")
-            ).hexdigest()
+            try:
+                attachment_hasher = hashlib.sha256()
+                with open(attachment, "rb") as attachment_file:
+                    for chunk in iter(lambda: attachment_file.read(1024 * 1024), b""):
+                        attachment_hasher.update(chunk)
+            except OSError:
+                failed_attachments.append(attachment)
+                continue
+            attachment_digest = attachment_hasher.hexdigest()
             attachment_component = f"{delivery_key}:file:{attachment_digest}"
             if already_sent("tg", group, attachment_component):
                 continue
@@ -807,7 +1135,7 @@ def _send_telegram_bundle_once(
             else:
                 failed_attachments.append(attachment)
 
-    if text_ok and not failed_attachments:
+    if text_ok and attachments_complete and not failed_attachments:
         mark_sent("tg", group, delivery_key)
         return "sent", []
     return "failed", failed_attachments
@@ -852,6 +1180,32 @@ def _attachment_urls(items) -> List[Tuple[str, str]]:
                 if isinstance(x, (dict, list)): walk(x)
     walk(items)
     return found
+
+
+def _attachment_identity_urls(items) -> List[str]:
+    """Canonical attachment identity independent of transport-only filenames."""
+    return sorted({_canonical_attachment_url_identity(url)
+                   for url, _ in _attachment_urls(items)})
+
+
+def _canonical_attachment_url_identity(url: str) -> str:
+    """Match relative/absolute copies of the same authenticated attachment URL."""
+    parsed = urlparse(one_line(url))
+    path = re.sub(r"/+", "/", parsed.path or "/")
+    if not path.startswith("/"):
+        path = "/" + path
+    secret_names = {
+        "access_token", "api_key", "auth", "authorization", "expires",
+        "password", "signature", "sig", "token",
+    }
+    query = []
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        lowered = key.casefold()
+        if lowered in secret_names or lowered.startswith(("x-amz-", "x-oss-")):
+            continue
+        query.append((key, value))
+    query.sort()
+    return path + (("?" + urlencode(query)) if query else "")
 
 # ---------- 浮動通知 ----------
 class FloatingService:
@@ -1060,6 +1414,23 @@ def format_for_tg(name: str, badge: str, content: str, ts_display: str, parse_mo
         title = f"{name}" + (f" [{badge}]" if badge else "")
         return f"{title}\n{sender_prefix}{content}\n{ts_display}"
 
+
+def _is_definite_preconnect_failure(error: Exception) -> bool:
+    """Identify connection failures that happened before Telegram got a request."""
+    message = str(error).casefold()
+    return any(marker in message for marker in (
+        "failed to establish a new connection",
+        "name resolution",
+        "temporary failure in name resolution",
+        "getaddrinfo failed",
+        "nodename nor servname",
+        "connection refused",
+        "actively refused",
+        "network is unreachable",
+        "no route to host",
+    ))
+
+
 class TelegramForwarder:
     def __init__(self, cfg: Dict):
         tgc = cfg.get("telegram", {}) or {}
@@ -1098,7 +1469,9 @@ class TelegramForwarder:
         if not (self.enabled and self._ok):
             return False
         from requests import post  # type: ignore
-        from requests.exceptions import ConnectTimeout, ConnectionError, ReadTimeout  # type: ignore
+        from requests.exceptions import (  # type: ignore
+            ConnectTimeout, ConnectionError, ReadTimeout, RequestException,
+        )
 
         def _try_send(txt: str, with_parse: bool) -> bool:
             self._rl()
@@ -1112,6 +1485,12 @@ class TelegramForwarder:
                 self._last_ts = time.time()
                 return True
             logging.warning("TG sendMessage 失敗: %s", r.text)
+            if r.status_code >= 500:
+                logging.error(
+                    "TG sendMessage HTTP %s result UNKNOWN; suppressing retry to avoid duplicate",
+                    r.status_code,
+                )
+                return True
             if r.status_code == 429:
                 try:
                     retry_after = max(1, int(r.json().get("parameters", {}).get("retry_after", 1)))
@@ -1130,7 +1509,21 @@ class TelegramForwarder:
                     return True
             except ConnectTimeout as e:
                 logging.warning("TG connect timeout before delivery(%s/%s): %s", i, self.retry, e)
-            except (ReadTimeout, ConnectionError) as e:
+            except ReadTimeout as e:
+                logging.error(
+                    "TG sendMessage result UNKNOWN; suppressing retry to avoid duplicate: %s", e
+                )
+                return True
+            except ConnectionError as e:
+                if not _is_definite_preconnect_failure(e):
+                    logging.error(
+                        "TG sendMessage result UNKNOWN; suppressing retry to avoid duplicate: %s", e
+                    )
+                    return True
+                logging.warning(
+                    "TG connection failed before delivery(%s/%s): %s", i, self.retry, e
+                )
+            except RequestException as e:
                 logging.error(
                     "TG sendMessage result UNKNOWN; suppressing retry to avoid duplicate: %s", e
                 )
@@ -1147,9 +1540,24 @@ class TelegramForwarder:
                         return True
                 except ConnectTimeout as e:
                     logging.warning("TG plain connect timeout(%s/%s): %s", i, self.retry, e)
-                except (ReadTimeout, ConnectionError) as e:
+                except ReadTimeout as e:
                     logging.error(
                         "TG plain send result UNKNOWN; suppressing retry to avoid duplicate: %s", e
+                    )
+                    return True
+                except ConnectionError as e:
+                    if not _is_definite_preconnect_failure(e):
+                        logging.error(
+                            "TG plain send result UNKNOWN; suppressing retry to avoid duplicate: %s", e
+                        )
+                        return True
+                    logging.warning(
+                        "TG plain connection failed before delivery(%s/%s): %s",
+                        i, self.retry, e,
+                    )
+                except RequestException as e:
+                    logging.error(
+                        "TG plain result UNKNOWN; suppressing retry to avoid duplicate: %s", e
                     )
                     return True
                 except Exception as e:
@@ -1162,7 +1570,9 @@ class TelegramForwarder:
         if not (self.enabled and self._ok and file_path.is_file()):
             return False
         from requests import post  # type: ignore
-        from requests.exceptions import ConnectTimeout, ConnectionError, ReadTimeout  # type: ignore
+        from requests.exceptions import (  # type: ignore
+            ConnectTimeout, ConnectionError, ReadTimeout, RequestException,
+        )
         method = "sendPhoto" if file_path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"} else "sendDocument"
         for attempt in range(1, self.retry + 1):
             try:
@@ -1180,6 +1590,12 @@ class TelegramForwarder:
                     self._last_ts = time.time()
                     return True
                 logging.warning("TG %s failed(%s/%s): %s", method, attempt, self.retry, response.text)
+                if response.status_code >= 500:
+                    logging.error(
+                        "TG %s HTTP %s result UNKNOWN; suppressing retry to avoid duplicate",
+                        method, response.status_code,
+                    )
+                    return True
                 if response.status_code == 429:
                     try:
                         retry_after = max(1, int(response.json().get("parameters", {}).get("retry_after", 1)))
@@ -1191,7 +1607,23 @@ class TelegramForwarder:
             except ConnectTimeout as e:
                 logging.warning("TG attachment connect timeout(%s/%s): %s", attempt, self.retry, e)
                 time.sleep(0.6 * attempt)
-            except (ReadTimeout, ConnectionError) as e:
+            except ReadTimeout as e:
+                logging.error(
+                    "TG attachment result UNKNOWN; suppressing retry to avoid duplicate: %s", e
+                )
+                return True
+            except ConnectionError as e:
+                if not _is_definite_preconnect_failure(e):
+                    logging.error(
+                        "TG attachment result UNKNOWN; suppressing retry to avoid duplicate: %s", e
+                    )
+                    return True
+                logging.warning(
+                    "TG attachment connection failed before delivery(%s/%s): %s",
+                    attempt, self.retry, e,
+                )
+                time.sleep(0.6 * attempt)
+            except RequestException as e:
                 logging.error(
                     "TG attachment result UNKNOWN; suppressing retry to avoid duplicate: %s", e
                 )
@@ -2476,16 +2908,20 @@ class App(tk.Tk):
                     pass
             self._push_from_worker({"type": "log", "text": "[INFO] 監控已啟動。\n"})
 
-            # Python 端兩個佇列：側欄(side)與訊息(msg)
+            # Python 端佇列：側欄 UI、原始快照、完整訊息與去重事件。
             py_side_q: asyncio.Queue = asyncio.Queue()
             py_msg_q: asyncio.Queue = asyncio.Queue()
+            py_snapshot_q: asyncio.Queue = asyncio.Queue()
             py_dedup_q: asyncio.Queue = asyncio.Queue()  # 新增：去重事件
 
             async def py_push_side(evt):
                 await py_side_q.put(evt)
 
             async def py_push_msg(evt):
-                await py_msg_q.put(evt)
+                if isinstance(evt, dict) and evt.get("type") == "side_snapshot":
+                    await py_snapshot_q.put(evt)
+                else:
+                    await py_msg_q.put(evt)
 
             async def py_push_dedup(evt):
                 # evt: {kind, group, time, sender, text, note?}
@@ -2498,6 +2934,7 @@ class App(tk.Tk):
             # 不點入群組：被動攔截頁面本來就收到的 API/WebSocket 訊息。
             # 只有群組側欄剛變動時才接受候選訊息，避免舊資料或其他 API 造成重複轉發。
             pending_groups = PendingPreviewBuffer()
+            sidebar_snapshots = SidebarSnapshotReducer()
             ingress_reservations = MessageIngressReservations()
             # A getMessageResponse can arrive before the separate channel-list event
             # that maps its CID to the sidebar title. Keep only these unresolved
@@ -2598,15 +3035,23 @@ class App(tk.Tk):
                             continue
                         waiting = unresolved_network_candidates.pop(cid)
                         group_key = self._normalize_group(group)[0]
+                        target_refs: List[Dict] = []
+                        seen_targets = set()
                         for deferred in waiting:
-                            item = deferred["item"]
-                            target = next((
-                                pending for pending in deferred["pending_refs"]
-                                if pending_groups.contains(pending)
-                                and self._normalize_group(pending.get("group", ""))[0] == group_key
-                            ), None)
-                            if target is None:
-                                continue
+                            for pending in deferred["pending_refs"]:
+                                marker = id(pending)
+                                if (marker not in seen_targets
+                                        and self._normalize_group(
+                                            pending.get("group", "")
+                                        )[0] == group_key):
+                                    seen_targets.add(marker)
+                                    target_refs.append(pending)
+                        items = _unique_message_candidates([
+                            dict(deferred["item"]) for deferred in waiting
+                        ])
+                        selected_items = items[-len(target_refs):] if target_refs else []
+                        selected_targets = target_refs[-len(selected_items):]
+                        for target, item in zip(selected_targets, selected_items):
                             item["group"] = group
                             claimed = _claim_backfill_candidate(
                                 pending_groups, target, item, ingress_reservations
@@ -2636,8 +3081,25 @@ class App(tk.Tk):
                             df.write(json.dumps(envelope, ensure_ascii=False) + "\n")
                     if response is not None:
                         learn_latest_message_recipe(response, candidates)
+                    known_batches: Dict[str, List[Dict]] = {}
                     for item in candidates:
-                        await enqueue_if_pending(item)
+                        cid = one_line(item.get("cid", ""))
+                        if cid and one_line(item.get("group", "")) == cid:
+                            await enqueue_if_pending(item)
+                            continue
+                        key = self._normalize_group(one_line(item.get("group", "")))[0]
+                        if key:
+                            known_batches.setdefault(key, []).append(item)
+                    for key, batch in known_batches.items():
+                        eligible = pending_groups.snapshot_for_group(key)
+                        for claimed in _claim_backfill_batch(
+                            pending_groups,
+                            key,
+                            batch,
+                            ingress_reservations,
+                            eligible_pending=eligible,
+                        ):
+                            await py_msg_q.put(claimed)
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     return
                 except Exception as e:
@@ -2665,6 +3127,7 @@ class App(tk.Tk):
                     # behind an earlier dense event from the same group.
                     if not pending_groups.contains(pending):
                         return
+                    eligible = pending_groups.snapshot_for_group(key)
                     for recipe in reversed(latest_message_recipes):
                         url = _replace_group_in_request(recipe["url"], recipe["group"], group)
                         data = _replace_group_in_request(recipe["post_data"], recipe["group"], group)
@@ -2680,7 +3143,11 @@ class App(tk.Tk):
                                 payload, "backfill", channel_names
                             )
                             claimed_batch = _claim_backfill_batch(
-                                pending_groups, key, candidates, ingress_reservations
+                                pending_groups,
+                                key,
+                                candidates,
+                                ingress_reservations,
+                                eligible_pending=eligible,
                             )
                             if claimed_batch:
                                 for claimed in claimed_batch:
@@ -2727,7 +3194,6 @@ class App(tk.Tk):
             await pg.evaluate("""
               () => {
                 const delay = (ms) => new Promise(r => setTimeout(r, ms));
-                const key = (t) => (t||\"\").trim().slice(0,160) + \"::\" + (t||\"\").length;
 
                 const pickRows = () => Array.from(document.querySelectorAll('.text.item .list-row'))
                   .filter(r => r.querySelector('.ellipsis1') && r.querySelector('.subinfo'));
@@ -2742,34 +3208,26 @@ class App(tk.Tk):
                     if (pickRows().length) break;
                     await delay(200);
                   }
-                  const lastSnapshot = new Map();
-                  const lastUnread = new Map();
-                  const push = (name, prev, time, badge, eventCount) => {
-                    const eventToken = [name, prev, time || '', badge || ''].join('||');
-                    const payload = { type: 'side_preview', group: name, sender: '', text: prev,
-                                      time: time || '', badge: badge || '', event_token: eventToken,
-                                      event_count: eventCount || 1 };
+                  const rowState = new Map();
+                  const canonicalName = (name) => (name || '')
+                    .replace(/\s*[（(]\s*\d+\s*[)）]\s*$/, '')
+                    .replace(/\s+/g, ' ').trim().toLowerCase();
+                  const push = (name, prev, time, badge) => {
+                    const payload = { type: 'side_snapshot', group: name, sender: '', text: prev,
+                                      time: time || '', badge: badge || '' };
                     try { window.pyPushMsg(payload); } catch (e) {}
-                    console.log('[MSG][side]', JSON.stringify(payload));
+                    console.log('[MSG][side-snapshot]', JSON.stringify(payload));
                   };
                   const scan = () => {
                     const rows = pickRows();
                     for (const r of rows) {
                       const name = getName(r), prev = getPrev(r), badge = getBadge(r), time = getTime(r);
                       if (!name || !prev) continue;
-                      const unread = parseInt((badge||'0').replace(/[^0-9]/g,''), 10) || 0;
-                      const previousUnread = lastUnread.get(name);
-                      lastUnread.set(name, unread);
-                      const k = name + '||' + key(prev) + '||' + time + '||' + badge;
-                      if (unread <= 0) {
-                        lastSnapshot.set(name, k);
-                        continue;
-                      }
-                      if (lastSnapshot.get(name) === k) continue;
-                      lastSnapshot.set(name, k);
-                      const eventCount = previousUnread !== undefined && unread > previousUnread
-                        ? Math.min(50, unread - previousUnread) : 1;
-                      push(name, prev, time, badge, eventCount);
+                      const groupKey = canonicalName(name);
+                      const signature = [name, prev, time || '', badge || ''].join('\u0000');
+                      if (rowState.get(groupKey) === signature) continue;
+                      rowState.set(groupKey, signature);
+                      push(name, prev, time, badge);
                     }
                   };
                   setTimeout(scan, 200);
@@ -3047,7 +3505,7 @@ class App(tk.Tk):
                                 setup();
                               }
                             """)
-                            # 側欄預覽只由前面的 side_preview 觀測器送入。
+                            # 側欄事件只由前面的 side_snapshot 觀測器送入。
                             # 舊版此處另有一個直接當成完整訊息的觀測器，會與 8 秒補抓流程競爭，
                             # 並以「群組＋相同預覽文字」吃掉連續照片事件。
 
@@ -3093,6 +3551,15 @@ class App(tk.Tk):
                     except asyncio.TimeoutError:
                         pass
 
+                    # 先抽乾已抵達的側欄快照，再判斷 quiet deadline；兩步
+                    # 之間沒有 await，因此已排隊的 badge 不會被舊 preview
+                    # 越過而先送出。
+                    _drain_sidebar_snapshot_queue(py_snapshot_q, sidebar_snapshots)
+
+                    # 將分階段更新的 preview/badge DOM 整併為一個穩定事件。
+                    for settled in sidebar_snapshots.pop_due():
+                        await py_msg_q.put(settled)
+
                     # 再處理訊息
                     try:
                         msg = await asyncio.wait_for(py_msg_q.get(), timeout=0.05)
@@ -3111,6 +3578,11 @@ class App(tk.Tk):
                         continue
 
                     sys_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    if msg.get("type") == "side_preview_update":
+                        raw_group = one_line(msg.get("group", ""))
+                        key = self._normalize_group(raw_group)[0]
+                        pending_groups.update_latest(key, msg.get("badge", ""), msg)
+                        continue
                     if msg.get("type") == "side_preview":
                         raw_group = one_line(msg.get("group", ""))
                         key = self._normalize_group(raw_group)[0]
@@ -3155,6 +3627,7 @@ class App(tk.Tk):
                         self._csv_append_row(csv_path, [sent, group, text, sender, badge])
 
                         saved_attachments: List[Path] = []
+                        attachments_complete = True
                         for raw_url, original_name in attachment_refs:
                             try:
                                 file_url = urljoin(base_url, raw_url)
@@ -3177,6 +3650,7 @@ class App(tk.Tk):
                                 saved_attachments.append(dest)
                                 self._push_from_worker({"type": "log", "text": f"[FILE] saved {dest}\n"})
                             except Exception as e:
+                                attachments_complete = False
                                 self._push_from_worker({"type": "log", "text": f"[FILE][WARN] download failed: {e}\n"})
 
                         # 浮動通知
@@ -3203,6 +3677,7 @@ class App(tk.Tk):
                                 saved_attachments=saved_attachments,
                                 already_sent=self._sent_done,
                                 mark_sent=self._sent_mark,
+                                attachments_complete=attachments_complete,
                             )
                             if delivery_status == "duplicate":
                                 self._push_from_worker({"type": "log", "text":
@@ -3216,12 +3691,12 @@ class App(tk.Tk):
                                     f"source={msg.get('source', msg.get('type', 'unknown'))})\n"})
                                 self._sent_log_row(sent, group, text, 'tg')
                             else:
-                                ingress_reservations.release(msg)
                                 for attachment in failed_attachments:
                                     self._push_from_worker({"type": "log", "text":
                                         f"[FILE][WARN] Telegram upload failed; kept local: {attachment}\n"})
                                 self._push_from_worker({"type": "log", "text":
-                                    "[WARN] Telegram 轉發失敗，未標記為已送出，後續事件會重試\n"})
+                                    "[WARN] Telegram 轉發失敗；保留已成功元件與訊息身分，"
+                                    "不以其他未讀事件重播\n"})
                     else:
                         # CSV 去重命中
                         self._push_from_worker({
