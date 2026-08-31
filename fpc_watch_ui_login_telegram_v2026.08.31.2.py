@@ -489,8 +489,10 @@ def _preview_fallback_message(pending: Dict) -> Dict:
     return {
         "type": "network_msg",
         "group": one_line(pending.get("group", "")),
-        "text": "" if pending.get("preview_uncertain")
-        else one_line(pending.get("preview", "")),
+        "text": "" if (
+            pending.get("preview_uncertain")
+            and not pending.get("preview_provisional")
+        ) else one_line(pending.get("preview", "")),
         "sender": "",
         "time": one_line(pending.get("time", "")),
         "attachments": [],
@@ -528,6 +530,8 @@ def _expand_side_preview_event(msg: Dict, group_key: str) -> List[Dict]:
             "event_token": token,
             "preview_uncertain": bool(msg.get("preview_uncertain", False))
                 or (event_count > 1 and index < event_count - 1),
+            "invalidate_badge": one_line(msg.get("invalidate_badge", ""))
+                if index == 0 else "",
         })
     return events
 
@@ -579,6 +583,7 @@ class SidebarSnapshotReducer:
                 "pending": None,
                 "deadline": None,
                 "slots": {},
+                "last_preview_update": None,
             }
             return
 
@@ -600,8 +605,16 @@ class SidebarSnapshotReducer:
             # Opening/reading a group resets the unread baseline; it is not a
             # delivery event.
             state["slots"].clear()
+            state["last_preview_update"] = None
         elif normalized["unread"] > base["unread"]:
             jump = normalized["unread"] - base["unread"]
+            last_update = state.get("last_preview_update")
+            invalidate_badge = ""
+            if (last_update
+                    and last_update["unread"] == base["unread"]
+                    and last_update["text"] == normalized["text"]):
+                invalidate_badge = str(base["unread"])
+            state["last_preview_update"] = None
             for unread in range(base["unread"] + 1, normalized["unread"] + 1):
                 slot = dict(normalized)
                 slot["badge"] = str(unread)
@@ -611,6 +624,8 @@ class SidebarSnapshotReducer:
                     not text_changed
                     or (jump > 1 and unread < normalized["unread"])
                 )
+                if invalidate_badge and unread == base["unread"] + 1:
+                    slot["invalidate_badge"] = invalidate_badge
                 state["slots"][unread] = slot
         elif normalized["unread"] in state["slots"]:
             # Badge-first staged render: replace the provisional old preview for
@@ -656,6 +671,10 @@ class SidebarSnapshotReducer:
                         "time": pending["time"],
                         "badge": pending["badge"],
                     })
+                    state["last_preview_update"] = {
+                        "unread": pending["unread"],
+                        "text": pending["text"],
+                    }
                 continue
             for slot in slots[-50:]:
                 event_token = "||".join((
@@ -671,6 +690,7 @@ class SidebarSnapshotReducer:
                     "event_token": event_token,
                     "event_count": 1,
                     "preview_uncertain": bool(slot.get("preview_uncertain", False)),
+                    "invalidate_badge": one_line(slot.get("invalidate_badge", "")),
                 })
         return events
 
@@ -795,7 +815,13 @@ class PendingPreviewBuffer:
             if self._key(item.get("group_key") or item.get("group", "")) == wanted
         ]
 
-    def update_latest(self, group_key: str, badge: str, event: Dict) -> bool:
+    def update_latest(
+        self,
+        group_key: str,
+        badge: str,
+        event: Dict,
+        now: Optional[float] = None,
+    ) -> bool:
         """Apply a late preview render to its existing unread event in place."""
         wanted = self._key(group_key)
         wanted_badge = one_line(badge)
@@ -808,13 +834,30 @@ class PendingPreviewBuffer:
                 continue
             item["preview"] = one_line(event.get("text", ""))
             item["time"] = one_line(event.get("time", ""))
-            item["preview_uncertain"] = False
+            item["preview_provisional"] = True
+            item["queued_at"] = time.time() if now is None else now
             item["event_token"] = "||".join((
                 one_line(event.get("group", "")),
                 item["preview"],
                 item["time"],
                 wanted_badge,
             ))
+            return True
+        return False
+
+    def invalidate_provisional(self, group_key: str, badge: str) -> bool:
+        """Prevent a preview later proven to belong to the next badge from fallback."""
+        wanted = self._key(group_key)
+        wanted_badge = one_line(badge)
+        for item in reversed(self._items):
+            if self._key(item.get("group_key") or item.get("group", "")) != wanted:
+                continue
+            if one_line(item.get("badge", "")) != wanted_badge:
+                continue
+            if not item.get("preview_provisional"):
+                continue
+            item["preview_provisional"] = False
+            item["preview_uncertain"] = True
             return True
         return False
 
@@ -3587,6 +3630,9 @@ class App(tk.Tk):
                         raw_group = one_line(msg.get("group", ""))
                         key = self._normalize_group(raw_group)[0]
                         if raw_group and key:
+                            invalidate_badge = one_line(msg.get("invalidate_badge", ""))
+                            if invalidate_badge:
+                                pending_groups.invalidate_provisional(key, invalidate_badge)
                             events = _expand_side_preview_event(msg, key)
                             for event in events:
                                 pending = pending_groups.add(event)

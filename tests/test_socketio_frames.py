@@ -1094,9 +1094,8 @@ class SocketIoFrameTests(unittest.TestCase):
 
         self.assertEqual(pending.count_for_group("群組"), 1)
         self.assertEqual(pending.snapshot_for_group("群組")[0]["preview"], "B")
-        self.assertFalse(
-            pending.snapshot_for_group("群組")[0]["preview_uncertain"]
-        )
+        self.assertTrue(pending.snapshot_for_group("群組")[0]["preview_uncertain"])
+        self.assertTrue(pending.snapshot_for_group("群組")[0]["preview_provisional"])
 
     def test_late_preview_cannot_overwrite_a_certain_previous_message(self):
         pending = watcher.PendingPreviewBuffer()
@@ -1111,6 +1110,65 @@ class SocketIoFrameTests(unittest.TestCase):
 
         self.assertFalse(updated)
         self.assertEqual(certain["preview"], "A")
+
+    def test_provisional_preview_refreshes_fallback_deadline_until_invalidation(self):
+        pending = watcher.PendingPreviewBuffer()
+        item = pending.add({
+            "group": "群組", "group_key": "群組", "preview": "Z",
+            "badge": "1", "preview_uncertain": True,
+        }, now=0)
+
+        self.assertTrue(pending.update_latest(
+            "群組", "1",
+            {"group": "群組", "text": "B", "time": "上午 11:32", "badge": "1"},
+            now=7.9,
+        ))
+        self.assertEqual(pending.pop_expired(now=8.1, max_age=8), [])
+        self.assertTrue(pending.invalidate_provisional("群組", "1"))
+        self.assertEqual(watcher._preview_fallback_message(item)["text"], "")
+
+    def test_next_preview_before_badge_cannot_duplicate_full_next_message(self):
+        reducer = watcher.SidebarSnapshotReducer()
+        reducer.observe({"group": "群組", "text": "Z", "badge": "0"}, now=0)
+        reducer.observe({"group": "群組", "text": "Z", "badge": "1"}, now=0.1)
+        first_events = reducer.pop_due(now=0.9)
+        self.assertEqual(len(first_events), 1)
+        self.assertTrue(first_events[0]["preview_uncertain"])
+
+        pending = watcher.PendingPreviewBuffer()
+        pending.add(watcher._expand_side_preview_event(first_events[0], "群組")[0], now=1.0)
+
+        reducer.observe({"group": "群組", "text": "B", "badge": "1"}, now=1.1)
+        update = reducer.pop_due(now=1.9)[0]
+        self.assertTrue(pending.update_latest("群組", "1", update))
+        first = pending.snapshot_for_group("群組")[0]
+        self.assertTrue(first["preview_provisional"])
+
+        reducer.observe({"group": "群組", "text": "B", "badge": "2"}, now=2.0)
+        second_event = reducer.pop_due(now=2.8)[0]
+        self.assertEqual(second_event["invalidate_badge"], "1")
+        self.assertTrue(pending.invalidate_provisional(
+            "群組", second_event["invalidate_badge"]
+        ))
+        pending.add(
+            watcher._expand_side_preview_event(second_event, "群組")[0], now=3.0
+        )
+
+        claimed = watcher._claim_backfill_batch(
+            pending,
+            "群組",
+            [{"group": "群組", "message_id": "m-b", "text": "B"}],
+            watcher.MessageIngressReservations(),
+        )
+
+        self.assertEqual([item["message_id"] for item in claimed], ["m-b"])
+        self.assertEqual(pending.count_for_group("群組"), 1)
+        self.assertEqual(
+            watcher._preview_fallback_message(
+                pending.snapshot_for_group("群組")[0]
+            )["text"],
+            "",
+        )
 
     def test_queued_badge_snapshot_is_drained_before_due_preview(self):
         reducer = watcher.SidebarSnapshotReducer()
