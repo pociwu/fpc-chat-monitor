@@ -109,6 +109,70 @@ def _enable_windows_dpi_awareness() -> None:
 
 _enable_windows_dpi_awareness()
 
+
+class SingleInstanceLock:
+    """Hold an OS-backed file lock for the lifetime of one monitor process."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self._handle = None
+
+    def acquire(self) -> bool:
+        if self._handle is not None:
+            return True
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(self.path, flags, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError(f"runtime lock is not a regular file: {self.path}")
+            handle = os.fdopen(fd, "r+b", buffering=0)
+        except Exception:
+            os.close(fd)
+            raise
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, BlockingIOError):
+            handle.close()
+            return False
+        self._handle = handle
+        return True
+
+    def release(self) -> None:
+        handle = self._handle
+        if handle is None:
+            return
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+            self._handle = None
+
+
+def _runtime_lock_path() -> Path:
+    """Use one per-user lock even when another version/copy is launched."""
+    runtime_root = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    if runtime_root:
+        return Path(runtime_root) / "fpc-chat-monitor" / "monitor.lock"
+    return Path.home() / ".local" / "state" / "fpc-chat-monitor" / "monitor.lock"
+
 # ---------- Windows asyncio 可靠化 ----------
 def _log_boot(msg: str):
     try:
@@ -149,7 +213,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 BASE = Path(__file__).resolve().parent
 CONFIG_PATH = BASE / "config.json"
-APP_VERSION = "v2026.08.30.2"
+APP_VERSION = "v2026.08.31.1"
 
 def one_line(s: str, keep_newline: bool = False) -> str:
     if not s:
@@ -406,11 +470,11 @@ def _remember_channel_names(payload, channel_names: Dict[str, str]) -> None:
 
 def _candidate_for_group(candidates: List[Dict], group: str) -> Optional[Dict]:
     """Return the newest candidate whose server-side group name matches the sidebar."""
-    wanted = re.sub(r"\s+", " ", group or "").strip().casefold()
+    wanted = _delivery_group_key(group)
     if not wanted:
         return None
     matched = [item for item in candidates
-               if re.sub(r"\s+", " ", item.get("group", "")).strip().casefold() == wanted]
+               if _delivery_group_key(item.get("group", "")) == wanted]
     if not matched:
         return None
     return matched[-1]
@@ -430,10 +494,42 @@ def _preview_fallback_message(pending: Dict) -> Dict:
         "badge": one_line(pending.get("badge", "")),
     }
 
+
+def _expand_side_preview_event(msg: Dict, group_key: str) -> List[Dict]:
+    """Expand an unread badge jump into one pending slot per new message."""
+    try:
+        event_count = int(msg.get("event_count", 1) or 1)
+    except (TypeError, ValueError):
+        event_count = 1
+    event_count = max(1, min(50, event_count))
+    raw_badge = one_line(msg.get("badge", ""))
+    badge_match = re.search(r"\d+", raw_badge)
+    badge_value = int(badge_match.group(0)) if badge_match else 0
+    first_badge = max(1, badge_value - event_count + 1)
+    base_token = one_line(msg.get("event_token", ""))
+    events: List[Dict] = []
+    for index in range(event_count):
+        badge = str(first_badge + index) if badge_value and event_count > 1 else raw_badge
+        token = base_token
+        if event_count > 1:
+            token = f"{base_token}||slot:{index + 1}/{event_count}"
+        events.append({
+            "group": one_line(msg.get("group", "")),
+            "group_key": group_key,
+            "preview": one_line(msg.get("text", "")),
+            "time": one_line(msg.get("time", "")),
+            "badge": badge,
+            "event_token": token,
+        })
+    return events
+
 class PendingPreviewBuffer:
     """保留密集側欄事件；同群組的新事件不可覆蓋舊事件。"""
+    ROW_SETTLE_SECONDS = 0.75
+
     def __init__(self):
         self._items: List[Dict] = []
+        self._recent_claims: List[Tuple[str, str, str, float, Dict]] = []
 
     @staticmethod
     def _key(group: str) -> str:
@@ -443,8 +539,42 @@ class PendingPreviewBuffer:
         return bool(self._items)
 
     def add(self, event: Dict, now: Optional[float] = None) -> Dict:
+        current = time.time() if now is None else now
         item = dict(event)
-        item["queued_at"] = time.time() if now is None else now
+        group_key = self._key(item.get("group_key") or item.get("group", ""))
+        preview = one_line(item.get("preview", "")).casefold()
+        badge = one_line(item.get("badge", ""))
+        self._recent_claims = [
+            claim for claim in self._recent_claims
+            if 0 <= current - claim[3] <= self.ROW_SETTLE_SECONDS
+        ]
+        if badge:
+            for claimed_group, claimed_preview, claimed_badge, _, claimed_item in reversed(
+                self._recent_claims
+            ):
+                if (claimed_group == group_key and claimed_preview == preview
+                        and claimed_badge == badge):
+                    # The full server message already won the race.  Absorb the
+                    # row's later time/badge render without creating a fallback.
+                    claimed_item.update(item)
+                    return claimed_item
+        # One row is rendered in stages (preview/badge/time).  The unread badge
+        # cannot stay equal for two genuine new unread messages, so only merge
+        # a brief rerender with the same positive badge. Badge 1 -> 2 remains two.
+        if badge:
+            for existing in reversed(self._items):
+                if self._key(existing.get("group_key") or existing.get("group", "")) != group_key:
+                    continue
+                age = current - float(existing.get("queued_at", current))
+                if age > self.ROW_SETTLE_SECONDS:
+                    break
+                if (one_line(existing.get("preview", "")).casefold() == preview
+                        and one_line(existing.get("badge", "")) == badge):
+                    existing.update(item)
+                    existing["queued_at"] = current
+                    return existing
+                break
+        item["queued_at"] = current
         self._items.append(item)
         return item
 
@@ -453,19 +583,47 @@ class PendingPreviewBuffer:
         return any(self._key(item.get("group_key") or item.get("group", "")) == wanted
                    for item in self._items)
 
+    def count_for_group(self, group_key: str) -> int:
+        wanted = self._key(group_key)
+        return sum(
+            1 for item in self._items
+            if self._key(item.get("group_key") or item.get("group", "")) == wanted
+        )
+
     def pop_for_group(self, group_key: str) -> Optional[Dict]:
         wanted = self._key(group_key)
         for index, item in enumerate(self._items):
             if self._key(item.get("group_key") or item.get("group", "")) == wanted:
-                return self._items.pop(index)
+                claimed = self._items.pop(index)
+                self._remember_claim(claimed)
+                return claimed
         return None
 
     def remove(self, target: Dict) -> bool:
         for index, item in enumerate(self._items):
             if item is target:
                 self._items.pop(index)
+                self._remember_claim(item)
                 return True
         return False
+
+    def _remember_claim(self, item: Dict) -> None:
+        badge = one_line(item.get("badge", ""))
+        if not badge:
+            return
+        self._recent_claims.append((
+            self._key(item.get("group_key") or item.get("group", "")),
+            one_line(item.get("preview", "")).casefold(),
+            badge,
+            time.time(),
+            item,
+        ))
+
+    def contains(self, target: Dict) -> bool:
+        return any(item is target for item in self._items)
+
+    def snapshot(self) -> List[Dict]:
+        return list(self._items)
 
     def pop_expired(self, now: Optional[float] = None, max_age: float = 8) -> List[Dict]:
         current = time.time() if now is None else now
@@ -474,13 +632,136 @@ class PendingPreviewBuffer:
         return expired
 
 
+class MessageIngressReservations:
+    """Reserve server message IDs before they can consume another sidebar event."""
+
+    def __init__(self):
+        self._keys = set()
+
+    @staticmethod
+    def _aliases(item: Dict) -> List[Tuple[str, str, str]]:
+        message_id = one_line(item.get("message_id", ""))
+        if not message_id:
+            return []
+        aliases: List[Tuple[str, str, str]] = []
+        cid = one_line(item.get("cid", ""))
+        group = _delivery_group_key(item.get("group", ""))
+        if cid:
+            aliases.append(("cid", cid, message_id))
+        if group:
+            aliases.append(("group", group, message_id))
+        return aliases
+
+    def contains(self, item: Dict) -> bool:
+        aliases = self._aliases(item)
+        return bool(aliases) and any(alias in self._keys for alias in aliases)
+
+    def reserve(self, item: Dict) -> bool:
+        aliases = self._aliases(item)
+        if not aliases:
+            return True
+        if any(alias in self._keys for alias in aliases):
+            return False
+        self._keys.update(aliases)
+        return True
+
+    def release(self, item: Dict) -> None:
+        for alias in self._aliases(item):
+            self._keys.discard(alias)
+
+
+def _claim_passive_candidate(
+    pending_groups: PendingPreviewBuffer,
+    group_key: str,
+    item: Dict,
+    reservations: MessageIngressReservations,
+) -> Optional[Dict]:
+    """Claim the next sidebar event only when this server message is new."""
+    if reservations.contains(item):
+        return None
+    pending = pending_groups.pop_for_group(group_key)
+    if pending is None:
+        return None
+    claimed = dict(item)
+    claimed["preview"] = pending.get("preview", "")
+    claimed.setdefault("event_token", pending.get("event_token", ""))
+    claimed.setdefault("badge", pending.get("badge", ""))
+    if not reservations.reserve(claimed):
+        raise RuntimeError("message reservation changed during an atomic claim")
+    return claimed
+
+
+def _claim_backfill_candidate(
+    pending_groups: PendingPreviewBuffer,
+    pending: Dict,
+    item: Dict,
+    reservations: Optional[MessageIngressReservations] = None,
+) -> Optional[Dict]:
+    """Atomically claim a pending sidebar event for the backfill producer.
+
+    Passive HTTP/WebSocket processing and backfill can finish in either order.
+    Only the producer that removes the pending object may enqueue a delivery.
+    """
+    if reservations is not None and reservations.contains(item):
+        return None
+    if not pending_groups.remove(pending):
+        return None
+    claimed = dict(item)
+    claimed["preview"] = pending.get("preview", "")
+    claimed.setdefault("event_token", pending.get("event_token", ""))
+    claimed.setdefault("badge", pending.get("badge", ""))
+    if reservations is not None and not reservations.reserve(claimed):
+        raise RuntimeError("message reservation changed during an atomic claim")
+    return claimed
+
+
+def _claim_backfill_batch(
+    pending_groups: PendingPreviewBuffer,
+    group_key: str,
+    candidates: List[Dict],
+    reservations: MessageIngressReservations,
+) -> List[Dict]:
+    """Pair the newest unseen server messages with dense pending events in order."""
+    pending_count = pending_groups.count_for_group(group_key)
+    if pending_count <= 0:
+        return []
+    wanted = _delivery_group_key(group_key)
+    matching = [
+        item for item in candidates
+        if _delivery_group_key(item.get("group", "")) == wanted
+        and not reservations.contains(item)
+    ]
+    claimed: List[Dict] = []
+    for item in matching[-pending_count:]:
+        candidate = _claim_passive_candidate(
+            pending_groups, group_key, item, reservations
+        )
+        if candidate is not None:
+            claimed.append(candidate)
+    return claimed
+
+
+def _delivery_group_key(value: str) -> str:
+    """Normalize display-only member counts without merging different groups."""
+    group = one_line(value)
+    group = re.sub(r"\s*[（(]\s*\d+\s*[)）]\s*$", "", group).strip()
+    return re.sub(r"\s+", " ", group).casefold()
+
+
 def _message_delivery_key(item: Dict) -> str:
     """建立逐筆傳送鍵；相同文字的不同訊息仍必須各自送達。"""
+    group = _delivery_group_key(item.get("group", ""))
+    message_id = one_line(item.get("message_id", ""))
+    if message_id:
+        # A server message ID is stable across passive, backfill, and DOM-derived
+        # copies. UI metadata such as member count, badge, and event token must
+        # not split the same server message into multiple deliveries.
+        identity = {"group": group, "message_id": message_id}
+        raw = json.dumps(identity, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
     attachments = _attachment_urls(item.get("attachments", []))
     identity = {
-        "group": one_line(item.get("group", "")),
-        "message_id": one_line(item.get("message_id", "")),
-        "event_token": one_line(item.get("event_token", "")),
+        "group": group,
         "badge": one_line(item.get("badge", "")),
         "time": one_line(item.get("time", "")),
         "text": one_line(item.get("text", ""), keep_newline=True),
@@ -488,6 +769,48 @@ def _message_delivery_key(item: Dict) -> str:
     }
     raw = json.dumps(identity, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _send_telegram_bundle_once(
+    tg,
+    group: str,
+    delivery_key: str,
+    styled: str,
+    plain: str,
+    should_send_text: bool,
+    saved_attachments: List[Path],
+    already_sent,
+    mark_sent,
+) -> Tuple[str, List[Path]]:
+    """Send one delivery identity at most once in the current monitor process."""
+    if already_sent("tg", group, delivery_key):
+        return "duplicate", []
+
+    text_component = f"{delivery_key}:text"
+    text_ok = True
+    if should_send_text and not already_sent("tg", group, text_component):
+        text_ok = tg.send_text(styled, fallback_plain=plain)
+        if text_ok:
+            mark_sent("tg", group, text_component)
+
+    failed_attachments: List[Path] = []
+    if text_ok:
+        for attachment in saved_attachments:
+            attachment_digest = hashlib.sha256(
+                str(attachment).encode("utf-8")
+            ).hexdigest()
+            attachment_component = f"{delivery_key}:file:{attachment_digest}"
+            if already_sent("tg", group, attachment_component):
+                continue
+            if tg.send_file(attachment, caption=f"{group}\n{attachment.name}"):
+                mark_sent("tg", group, attachment_component)
+            else:
+                failed_attachments.append(attachment)
+
+    if text_ok and not failed_attachments:
+        mark_sent("tg", group, delivery_key)
+        return "sent", []
+    return "failed", failed_attachments
 
 def _replace_group_in_request(value: str, learned_group: str, target_group: str) -> str:
     """Replay a learned request for another group without ever manipulating the UI."""
@@ -771,10 +1094,11 @@ class TelegramForwarder:
             time.sleep(need - dt)
 
     def send_text(self, text: str, fallback_plain: Optional[str] = None) -> bool:
-        """先依設定 parse_mode 發送；若 400 parse error，再用純文字重送一次。"""
+        """Send without replaying a request whose delivery result is ambiguous."""
         if not (self.enabled and self._ok):
             return False
         from requests import post  # type: ignore
+        from requests.exceptions import ConnectTimeout, ConnectionError, ReadTimeout  # type: ignore
 
         def _try_send(txt: str, with_parse: bool) -> bool:
             self._rl()
@@ -804,6 +1128,13 @@ class TelegramForwarder:
             try:
                 if _try_send(text, with_parse=True):
                     return True
+            except ConnectTimeout as e:
+                logging.warning("TG connect timeout before delivery(%s/%s): %s", i, self.retry, e)
+            except (ReadTimeout, ConnectionError) as e:
+                logging.error(
+                    "TG sendMessage result UNKNOWN; suppressing retry to avoid duplicate: %s", e
+                )
+                return True
             except Exception as e:
                 logging.exception("TG sendMessage 例外(%s/%s): %s", i, self.retry, e)
             time.sleep(0.6 * i)
@@ -814,6 +1145,13 @@ class TelegramForwarder:
                 try:
                     if _try_send(fallback_plain, with_parse=False):
                         return True
+                except ConnectTimeout as e:
+                    logging.warning("TG plain connect timeout(%s/%s): %s", i, self.retry, e)
+                except (ReadTimeout, ConnectionError) as e:
+                    logging.error(
+                        "TG plain send result UNKNOWN; suppressing retry to avoid duplicate: %s", e
+                    )
+                    return True
                 except Exception as e:
                     logging.exception("TG 純文字重送 例外(%s/%s): %s", i, self.retry, e)
                 time.sleep(0.6 * i)
@@ -824,6 +1162,7 @@ class TelegramForwarder:
         if not (self.enabled and self._ok and file_path.is_file()):
             return False
         from requests import post  # type: ignore
+        from requests.exceptions import ConnectTimeout, ConnectionError, ReadTimeout  # type: ignore
         method = "sendPhoto" if file_path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"} else "sendDocument"
         for attempt in range(1, self.retry + 1):
             try:
@@ -849,6 +1188,14 @@ class TelegramForwarder:
                     time.sleep(retry_after)
                 else:
                     time.sleep(0.6 * attempt)
+            except ConnectTimeout as e:
+                logging.warning("TG attachment connect timeout(%s/%s): %s", attempt, self.retry, e)
+                time.sleep(0.6 * attempt)
+            except (ReadTimeout, ConnectionError) as e:
+                logging.error(
+                    "TG attachment result UNKNOWN; suppressing retry to avoid duplicate: %s", e
+                )
+                return True
             except Exception as e:
                 logging.exception("TG attachment upload failed(%s/%s): %s", attempt, self.retry, e)
                 time.sleep(0.6 * attempt)
@@ -1152,7 +1499,7 @@ class App(tk.Tk):
                 pass
 
     def _sent_key(self, group: str, content: str) -> str:
-        return f"{group}\x1f{content}"
+        return f"{_delivery_group_key(group)}\x1f{content}"
 
     def _sent_done(self, kind: str, group: str, content: str) -> bool:
         self._sent__init()
@@ -2151,6 +2498,7 @@ class App(tk.Tk):
             # 不點入群組：被動攔截頁面本來就收到的 API/WebSocket 訊息。
             # 只有群組側欄剛變動時才接受候選訊息，避免舊資料或其他 API 造成重複轉發。
             pending_groups = PendingPreviewBuffer()
+            ingress_reservations = MessageIngressReservations()
             # A getMessageResponse can arrive before the separate channel-list event
             # that maps its CID to the sidebar title. Keep only these unresolved
             # candidates briefly, then retry once the mapping is known.
@@ -2159,7 +2507,7 @@ class App(tk.Tk):
             # the same authenticated browser context.  Replaying an HTTP request does
             # not click, focus, select, or otherwise alter a chat in the page UI.
             latest_message_recipes: List[Dict] = []
-            backfill_inflight: set[str] = set()
+            backfill_locks: Dict[str, asyncio.Lock] = {}
             channel_names: Dict[str, str] = {}
             diag_dir = out_dir / "network_diagnostics"
             diag_dir.mkdir(parents=True, exist_ok=True)
@@ -2213,20 +2561,31 @@ class App(tk.Tk):
 
                     async def enqueue_if_pending(item: Dict, allow_defer: bool = True) -> bool:
                         key = self._normalize_group(one_line(item.get("group", "")))[0]
-                        pending = pending_groups.pop_for_group(key)
-                        if pending:
-                            item["preview"] = pending.get("preview", "")
-                            item.setdefault("event_token", pending.get("event_token", ""))
-                            item.setdefault("badge", pending.get("badge", ""))
-                            await py_msg_q.put(item)
+                        was_reserved = ingress_reservations.contains(item)
+                        claimed = _claim_passive_candidate(
+                            pending_groups, key, item, ingress_reservations
+                        )
+                        if claimed:
+                            await py_msg_q.put(claimed)
                             return True
+                        if was_reserved:
+                            self._push_from_worker({"type": "log", "text":
+                                f"[NET][SKIP] duplicate server message before pending claim: "
+                                f"{item.get('message_id', '')}\n"})
+                            return False
                         cid = str(item.get("cid", "") or "")
                         # Defer only an ID-only candidate while a sidebar change is
                         # pending. This avoids replaying unrelated historical data.
                         if allow_defer and cid and item.get("group") == cid and pending_groups:
                             waiting = unresolved_network_candidates.setdefault(cid, [])
-                            waiting.append(item)
-                            del waiting[:-8]
+                            waiting.append({
+                                "item": dict(item),
+                                "pending_refs": pending_groups.snapshot(),
+                            })
+                            if len(waiting) > 256:
+                                del waiting[:-256]
+                                self._push_from_worker({"type": "log", "text":
+                                    f"[NET][WARN] deferred CID queue capped at 256 for {cid}\n"})
                             self._push_from_worker({"type": "log", "text":
                                 f"[NET] full payload received for CID {cid}; waiting channel title mapping\n"})
                         return False
@@ -2238,9 +2597,22 @@ class App(tk.Tk):
                         if not group:
                             continue
                         waiting = unresolved_network_candidates.pop(cid)
-                        for item in waiting:
+                        group_key = self._normalize_group(group)[0]
+                        for deferred in waiting:
+                            item = deferred["item"]
+                            target = next((
+                                pending for pending in deferred["pending_refs"]
+                                if pending_groups.contains(pending)
+                                and self._normalize_group(pending.get("group", ""))[0] == group_key
+                            ), None)
+                            if target is None:
+                                continue
                             item["group"] = group
-                            await enqueue_if_pending(item, allow_defer=False)
+                            claimed = _claim_backfill_candidate(
+                                pending_groups, target, item, ingress_reservations
+                            )
+                            if claimed is not None:
+                                await py_msg_q.put(claimed)
                     candidates = _network_message_candidates(payload, source, channel_names)
                     with open(diag_dir / f"network_{datetime.now().strftime('%Y%m%d')}.jsonl", "a", encoding="utf-8") as df:
                         df.write(json.dumps({"at": datetime.now().isoformat(timespec="seconds"), "source": source,
@@ -2285,10 +2657,14 @@ class App(tk.Tk):
                 """Fetch one latest message for a sidebar group without changing page UI."""
                 group = pending["group"]
                 key = self._normalize_group(group)[0]
-                if not key or key in backfill_inflight:
+                if not key:
                     return
-                backfill_inflight.add(key)
-                try:
+                lock = backfill_locks.setdefault(key, asyncio.Lock())
+                async with lock:
+                    # A passive payload may resolve this event while it waits
+                    # behind an earlier dense event from the same group.
+                    if not pending_groups.contains(pending):
+                        return
                     for recipe in reversed(latest_message_recipes):
                         url = _replace_group_in_request(recipe["url"], recipe["group"], group)
                         data = _replace_group_in_request(recipe["post_data"], recipe["group"], group)
@@ -2300,21 +2676,29 @@ class App(tk.Tk):
                             if not response.ok:
                                 continue
                             payload = await response.json()
-                            item = _candidate_for_group(_network_message_candidates(payload, "backfill", channel_names), group)
-                            if item:
-                                item["preview"] = pending.get("preview", "")
-                                pending_groups.remove(pending)
-                                await py_msg_q.put(item)
+                            candidates = _network_message_candidates(
+                                payload, "backfill", channel_names
+                            )
+                            claimed_batch = _claim_backfill_batch(
+                                pending_groups, key, candidates, ingress_reservations
+                            )
+                            if claimed_batch:
+                                for claimed in claimed_batch:
+                                    await py_msg_q.put(claimed)
                                 self._push_from_worker({"type": "log", "text":
-                                    f"[NET] full last message fetched for {group} without opening the group\n"})
+                                    f"[NET] fetched {len(claimed_batch)} full message(s) for "
+                                    f"{group} without opening the group\n"})
+                                return
+                            if _candidate_for_group(candidates, group) is not None:
+                                self._push_from_worker({"type": "log", "text":
+                                    f"[NET][SKIP] pending already delivered or message already "
+                                    f"reserved for {group}; backfill discarded\n"})
                                 return
                         except Exception as e:
                             self._push_from_worker({"type": "log", "text":
                                 f"[NET][WARN] latest-message backfill failed for {group}: {e}\n"})
                     self._push_from_worker({"type": "log", "text":
                         f"[NET] no reusable full-message API yet for {group}; preview withheld\n"})
-                finally:
-                    backfill_inflight.discard(key)
 
             def on_websocket(ws):
                 def frame_received(frame):
@@ -2336,8 +2720,9 @@ class App(tk.Tk):
             except Exception as e:
                 self._push_from_worker({"type": "log", "text": f"[NET][WARN] Socket.IO capture reload failed: {e}\n"})
 
-            # ---- ① 側欄觀測器（僅更新左側群組與未讀）----
-            await _attach_msg_preview(pg)
+            # The selected-chat DOM has no stable server message ID. Sending it
+            # alongside HTTP/WebSocket/backfill creates two identities for one
+            # message, so it is intentionally not attached in unopened-group mode.
             # ---- ①b 直接從側欄預覽推播 msg（預覽非空且未讀>0）----
             await pg.evaluate("""
               () => {
@@ -2357,11 +2742,13 @@ class App(tk.Tk):
                     if (pickRows().length) break;
                     await delay(200);
                   }
-                  const seen = new Set();
-                  const push = (name, prev, time, badge) => {
+                  const lastSnapshot = new Map();
+                  const lastUnread = new Map();
+                  const push = (name, prev, time, badge, eventCount) => {
                     const eventToken = [name, prev, time || '', badge || ''].join('||');
                     const payload = { type: 'side_preview', group: name, sender: '', text: prev,
-                                      time: time || '', badge: badge || '', event_token: eventToken };
+                                      time: time || '', badge: badge || '', event_token: eventToken,
+                                      event_count: eventCount || 1 };
                     try { window.pyPushMsg(payload); } catch (e) {}
                     console.log('[MSG][side]', JSON.stringify(payload));
                   };
@@ -2371,15 +2758,30 @@ class App(tk.Tk):
                       const name = getName(r), prev = getPrev(r), badge = getBadge(r), time = getTime(r);
                       if (!name || !prev) continue;
                       const unread = parseInt((badge||'0').replace(/[^0-9]/g,''), 10) || 0;
-                      if (unread <= 0) continue;
+                      const previousUnread = lastUnread.get(name);
+                      lastUnread.set(name, unread);
                       const k = name + '||' + key(prev) + '||' + time + '||' + badge;
-                      if (seen.has(k)) continue;
-                      seen.add(k);
-                      push(name, prev, time, badge);
+                      if (unread <= 0) {
+                        lastSnapshot.set(name, k);
+                        continue;
+                      }
+                      if (lastSnapshot.get(name) === k) continue;
+                      lastSnapshot.set(name, k);
+                      const eventCount = previousUnread !== undefined && unread > previousUnread
+                        ? Math.min(50, unread - previousUnread) : 1;
+                      push(name, prev, time, badge, eventCount);
                     }
                   };
                   setTimeout(scan, 200);
-                  const mo = new MutationObserver(() => scan());
+                  let settleTimer = null;
+                  const scheduleScan = () => {
+                    if (settleTimer !== null) clearTimeout(settleTimer);
+                    settleTimer = setTimeout(() => {
+                      settleTimer = null;
+                      scan();
+                    }, 250);
+                  };
+                  const mo = new MutationObserver(scheduleScan);
                   mo.observe(document.body, { childList: true, subtree: true, characterData: true });
                   setInterval(scan, 3000);
                 };
@@ -2517,9 +2919,12 @@ class App(tk.Tk):
                                 return (panel ? panel.outerHTML : document.documentElement.outerHTML);
                             }""")
                             
-                            # ---- ③ 訊息預覽觀測器（方案A 加強版：更多選擇器＋偵錯日誌）----
+                            # DOM dump is read-only.  This legacy observer body is
+                            # retained for diagnostics but must never attach a
+                            # second pyPushMsg producer.
                             await pg.evaluate("""
                               () => {
+                                return false;
                                 const delay = (ms) => new Promise(r => setTimeout(r, ms));
                                 const pickRoot = () => {
                                   const cs = document.querySelector("#cs");
@@ -2710,16 +3115,13 @@ class App(tk.Tk):
                         raw_group = one_line(msg.get("group", ""))
                         key = self._normalize_group(raw_group)[0]
                         if raw_group and key:
-                            pending = pending_groups.add({
-                                "group": raw_group,
-                                "group_key": key,
-                                "preview": one_line(msg.get("text", "")),
-                                "time": one_line(msg.get("time", "")),
-                                "badge": one_line(msg.get("badge", "")),
-                                "event_token": one_line(msg.get("event_token", "")),
-                            })
-                            self._push_from_worker({"type": "log", "text": f"[NET] waiting full payload: {raw_group}\n"})
-                            asyncio.create_task(backfill_last_message(pending))
+                            events = _expand_side_preview_event(msg, key)
+                            for event in events:
+                                pending = pending_groups.add(event)
+                                asyncio.create_task(backfill_last_message(pending))
+                            self._push_from_worker({"type": "log", "text":
+                                f"[NET] waiting full payload: {raw_group} "
+                                f"(slots={len(events)})\n"})
                         continue
                     group = one_line(msg.get("group", ""))
                     sender= one_line(msg.get("sender", ""))
@@ -2789,26 +3191,37 @@ class App(tk.Tk):
                             self._push_from_worker({"type":"log","text":f"[WARN] 通知顯示失敗: {e}\n"})
                         # Telegram 轉發
                         if tg.enabled:
-                            self._push_from_worker({"type":"log","text":f"[INFO] Telegram 送出 → {group}: {text[:28]}... (parse={tg.parse_mode or 'plain'})\n"})
-                            self._push_from_worker({"type":"log","text":f"[INFO] Telegram 送出 → {group}: {text[:24]}...\n"})
                             styled = format_for_tg(group, badge, text, sent, tg.parse_mode, sender)
                             plain  = format_for_tg(group, badge, text, sent, None, sender)
-                            if self._sent_done('tg', group, delivery_key):
-                                self._push_from_worker({"type": "log", "text": "[TG][SKIP] already sent\n"})
+                            delivery_status, failed_attachments = _send_telegram_bundle_once(
+                                tg=tg,
+                                group=group,
+                                delivery_key=delivery_key,
+                                styled=styled,
+                                plain=plain,
+                                should_send_text=bool(text or sender),
+                                saved_attachments=saved_attachments,
+                                already_sent=self._sent_done,
+                                mark_sent=self._sent_mark,
+                            )
+                            if delivery_status == "duplicate":
+                                self._push_from_worker({"type": "log", "text":
+                                    f"[TG][SKIP] already sent (delivery={delivery_key[:12]}, "
+                                    f"source={msg.get('source', msg.get('type', 'unknown'))})\n"})
+                            elif delivery_status == "sent":
+                                self._push_from_worker({"type":"log","text":
+                                    f"[INFO] Telegram 送出 → {group}: {text[:28]}... "
+                                    f"(parse={tg.parse_mode or 'plain'}, "
+                                    f"delivery={delivery_key[:12]}, "
+                                    f"source={msg.get('source', msg.get('type', 'unknown'))})\n"})
+                                self._sent_log_row(sent, group, text, 'tg')
                             else:
-                                text_ok = tg.send_text(styled, fallback_plain=plain) if (text or sender) else True
-                                files_ok = True
-                                if text_ok:
-                                    for attachment in saved_attachments:
-                                        if not tg.send_file(attachment, caption=f"{group}\n{attachment.name}"):
-                                            files_ok = False
-                                            self._push_from_worker({"type": "log", "text": f"[FILE][WARN] Telegram upload failed; kept local: {attachment}\n"})
-                                ok = text_ok and files_ok
-                                if ok:
-                                    self._sent_mark('tg', group, delivery_key)
-                                    self._sent_log_row(sent, group, text, 'tg')
-                                else:
-                                    self._push_from_worker({"type": "log", "text": "[WARN] Telegram 轉發失敗，未標記為已送出，後續事件會重試\n"})
+                                ingress_reservations.release(msg)
+                                for attachment in failed_attachments:
+                                    self._push_from_worker({"type": "log", "text":
+                                        f"[FILE][WARN] Telegram upload failed; kept local: {attachment}\n"})
+                                self._push_from_worker({"type": "log", "text":
+                                    "[WARN] Telegram 轉發失敗，未標記為已送出，後續事件會重試\n"})
                     else:
                         # CSV 去重命中
                         self._push_from_worker({
@@ -2825,35 +3238,55 @@ class App(tk.Tk):
                 self._push_from_worker({"type": "log", "text": "[INFO] 監控已結束。\n"})
 
 def main():
-    app = App()
-    # 系統訊息區（晚建立也 OK，供 log_sys 使用）
-    frm = ttk.Frame(app.monitor_body)
-    frm.pack(fill=tk.BOTH, expand=True, padx=0, pady=(0, 6))
-    ttk.Label(frm, text="系統訊息").pack(anchor="w")
-    app.sys_scroll = ttk.Scrollbar(frm, orient="vertical")
-    app.syslog = tk.Text(frm, height=int(app.ui_metrics["log_height"]), yscrollcommand=app.sys_scroll.set)
-    app.sys_scroll.config(command=app.syslog.yview)
-    app.syslog.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-    app.sys_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-    if "--ui-smoke-test" in sys.argv:
-        app.update_idletasks()
-        app.update()
-        smoke_layout = {
-            "window": [app.winfo_width(), app.winfo_height()],
-            "canvas": [app.monitor_canvas.winfo_width(), app.monitor_canvas.winfo_height()],
-            "body": [app.monitor_body.winfo_width(), app.monitor_body.winfo_height()],
-            "body_requested": [app.monitor_body.winfo_reqwidth(), app.monitor_body.winfo_reqheight()],
-        }
-        app.withdraw()
-        print(json.dumps({
-            "app_version": APP_VERSION,
-            "metrics": app.ui_metrics,
-            "layout": smoke_layout,
-            "monitor_scrollregion": app.monitor_canvas.cget("scrollregion"),
-        }, ensure_ascii=False))
-        app.destroy()
-        return
-    app.mainloop()
+    instance_lock = SingleInstanceLock(_runtime_lock_path())
+    try:
+        acquired = instance_lock.acquire()
+    except OSError as exc:
+        print(
+            f"ERROR: 無法建立單一執行鎖 {_runtime_lock_path()}: {exc}",
+            file=sys.stderr,
+        )
+        return 2
+    if not acquired:
+        print(
+            "ERROR: 已有另一個 FPC chat monitor 程式正在執行；"
+            "請先關閉舊程序再啟動新版。",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        app = App()
+        # 系統訊息區（晚建立也 OK，供 log_sys 使用）
+        frm = ttk.Frame(app.monitor_body)
+        frm.pack(fill=tk.BOTH, expand=True, padx=0, pady=(0, 6))
+        ttk.Label(frm, text="系統訊息").pack(anchor="w")
+        app.sys_scroll = ttk.Scrollbar(frm, orient="vertical")
+        app.syslog = tk.Text(frm, height=int(app.ui_metrics["log_height"]), yscrollcommand=app.sys_scroll.set)
+        app.sys_scroll.config(command=app.syslog.yview)
+        app.syslog.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        app.sys_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        if "--ui-smoke-test" in sys.argv:
+            app.update_idletasks()
+            app.update()
+            smoke_layout = {
+                "window": [app.winfo_width(), app.winfo_height()],
+                "canvas": [app.monitor_canvas.winfo_width(), app.monitor_canvas.winfo_height()],
+                "body": [app.monitor_body.winfo_width(), app.monitor_body.winfo_height()],
+                "body_requested": [app.monitor_body.winfo_reqwidth(), app.monitor_body.winfo_reqheight()],
+            }
+            app.withdraw()
+            print(json.dumps({
+                "app_version": APP_VERSION,
+                "metrics": app.ui_metrics,
+                "layout": smoke_layout,
+                "monitor_scrollregion": app.monitor_canvas.cget("scrollregion"),
+            }, ensure_ascii=False))
+            app.destroy()
+            return 0
+        app.mainloop()
+        return 0
+    finally:
+        instance_lock.release()
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

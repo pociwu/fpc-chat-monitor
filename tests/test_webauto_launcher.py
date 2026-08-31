@@ -27,6 +27,15 @@ class WebautoLauncherContractTests(unittest.TestCase):
         self.assertIn('exec python "$latest"', source)
         self.assertNotIn("python fpc_watch_ui_login_telegram_v2025", source)
 
+    def test_refuses_to_start_while_any_monitor_version_is_running(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn(" -af ", source)
+        self.assertIn("an FPC chat monitor is already running", source)
+        self.assertIn("exit 2", source)
+        self.assertIn('pgrep -u "$(id -u)"', source)
+        self.assertIn("pgrep_status > 1", source)
+
 
 if __name__ == "__main__":
     unittest.main()

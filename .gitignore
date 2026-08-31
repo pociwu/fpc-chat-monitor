@@ -16,6 +16,7 @@ sent_log_*.csv
 sent_flags_*.json
 message_api_*.jsonl
 local_verification/
+.fpc_chat_monitor.lock
 
 # Python and editor artifacts
 __pycache__/

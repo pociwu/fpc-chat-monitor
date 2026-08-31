@@ -17,6 +17,24 @@ fi
 cd "$APP_DIR"
 shopt -s nullglob
 
+# Guard the first upgrade from older versions that did not hold the Python
+# runtime lock.  Do not silently start a second monitor and duplicate Telegram.
+if ! command -v pgrep >/dev/null 2>&1; then
+  echo "ERROR: pgrep is required to verify that no older monitor is running." >&2
+  exit 2
+fi
+pgrep_status=0
+running_monitors="$(pgrep -u "$(id -u)" -af '(^|/|[[:space:]])python[^[:space:]]*[[:space:]].*fpc_watch_ui_login_telegram_.*\.py($|[[:space:]])')" || pgrep_status=$?
+if (( pgrep_status > 1 )); then
+  echo "ERROR: unable to inspect running monitor processes (pgrep exit $pgrep_status)." >&2
+  exit 2
+fi
+if [[ -n "$running_monitors" ]]; then
+  echo "ERROR: an FPC chat monitor is already running; stop it before launching another version:" >&2
+  echo "$running_monitors" >&2
+  exit 2
+fi
+
 versioned=(fpc_watch_ui_login_telegram_v[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9].[0-9]*.py)
 if (( ${#versioned[@]} == 0 )); then
   echo "ERROR: no versioned program found (expected fpc_watch_ui_login_telegram_vYYYY.MM.DD.N.py)" >&2
